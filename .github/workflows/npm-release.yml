@@ -1,0 +1,122 @@
+name: npm release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm (requires an unreleased version tag and npm trusted publisher)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_PUBLISH: ${{ github.event_name == 'release' || inputs.publish == true }}
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.12.0'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Check package identity, version and publishing intent
+        shell: pwsh
+        run: |
+          $releaseArgs = @('tool/release.py', 'metadata')
+          if ($env:RELEASE_PUBLISH -eq 'true') {
+            $releaseArgs += @('--require-tag', '--check-unpublished')
+          }
+          python @releaseArgs
+      - name: Test release guards
+        run: python -m unittest discover -s tool -p test_release_tools.py
+      - name: Build the independent native bundle
+        run: python tool/build_native.py
+      - name: Analyze Dart
+        run: dart analyze
+      - name: Test Dart runtime
+        run: python tool/test_runtime.py
+      - name: Test Rust workspace
+        run: cargo test --manifest-path next/Cargo.toml --release --locked
+      - name: Test npm launcher and updater
+        run: node --test npm/expert/test/*.test.cjs
+      - name: Test media worker
+        run: .\server\.venv\Scripts\python.exe -m unittest discover -s server -p test_desktop_media_worker.py
+      - name: Check terminal protocol fixtures
+        run: .\server\.venv\Scripts\python.exe tool/check_tui_contract.py
+      - name: Check isolated standalone startup
+        run: .\server\.venv\Scripts\python.exe tool/standalone_smoke.py
+      - name: Check isolated Host recovery and persistence
+        run: .\server\.venv\Scripts\python.exe tool/host_e2e.py --bundle output/native/bundle --report output/validation/host-e2e.json
+      - name: Build npm tarball without publishing
+        run: python tool/build_tui_npm_release.py --skip-build
+      - name: Verify real local npm installation and registry update
+        run: node tool/test_tui_npm_release.cjs
+      - name: Verify portable release payload
+        run: python tool/release.py verify output/releases
+      - uses: actions/upload-artifact@v7
+        with:
+          name: expert-npm-release
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            output/releases/*/*.tgz
+            output/releases/*/*.zip
+            output/releases/*/release.json
+            output/releases/*/npm-acceptance.json
+            output/validation/*.json
+
+  publish:
+    if: ${{ github.event_name == 'release' || inputs.publish == true }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install an OIDC-capable npm CLI
+        run: npm install --global npm@11.21.1 --ignore-scripts --registry=https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          name: expert-npm-release
+          path: release-artifacts
+      - name: Reject branch publishes and existing npm versions
+        run: python tool/release.py metadata --require-tag --check-unpublished
+      - name: Verify the exact tarball to publish
+        id: verify
+        run: python tool/release.py verify release-artifacts
+      - name: Publish the validated tarball through npm OIDC
+        env:
+          TARBALL: ${{ steps.verify.outputs.tarball }}
+        run: npm publish "$TARBALL" --access public --provenance --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Verify the registry serves the published payload
+        run: python tool/release.py verify release-artifacts --check-published

@@ -11,7 +11,7 @@ const runtime = require('../lib/runtime.cjs');
 const updater = require('../lib/update.cjs');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'expert-npm-test-'));
 process.env.EXPERT_CLI_HOME = path.join(root, 'cache');
-const name = '@fixture/expert-tui';
+const name = '@fixture/expert';
 function fixture(version, suffix = '') {
   const dir = path.join(root, `package-${version}${suffix}`);
   fs.mkdirSync(dir);

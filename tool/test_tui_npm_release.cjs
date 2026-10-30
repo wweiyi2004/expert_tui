@@ -47,11 +47,11 @@ async function main() {
     await command([npmCli(), 'install', '--global', '--prefix', prefix, '--ignore-scripts', '--no-audit', '--no-fund', release.tgz]);
     const installed = path.join(prefix, 'node_modules', ...pkg.name.split('/'));
     runtime.validatePackage(installed, pkg.name, pkg.version);
-    if (!fs.existsSync(path.join(prefix, 'expert-tui.cmd'))) throw new Error('npm did not create the expert command shim');
+    if (!fs.existsSync(path.join(prefix, 'expert.cmd'))) throw new Error('npm did not create the expert command shim');
     const entry = path.join(installed, 'bin/expert.cjs');
     const version = await command([entry, 'version', '--json']);
     if (JSON.parse(version.stdout).version !== pkg.version) throw new Error('Installed version mismatch');
-    report.checks.push('npm tarball installs globally into a prefix containing spaces and creates expert-tui.cmd');
+    report.checks.push('npm tarball installs globally into a prefix containing spaces and creates expert.cmd');
     const snapshot = await command([entry, '--snapshot', 'welcome', '--width', '60', '--height', '24']);
     if (!snapshot.stdout.trim()) throw new Error('Native offline render failed');
     if (fs.existsSync(path.join(root, 'state/host/discovery/bridge.json'))) throw new Error('Offline rendering started Host');

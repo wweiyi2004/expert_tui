@@ -5,7 +5,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-const NAME = /^@[a-z0-9][a-z0-9._-]*\/expert-tui$/;
+const NAME = /^@[a-z0-9][a-z0-9._-]*\/expert$/;
 const ROOT_FILES = ['bin', 'lib', 'native', 'expert.cmd', 'package.json', 'release-manifest.json', 'README.md', 'LICENSE'];
 function readJson(file) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
 function metadata(root) {

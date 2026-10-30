@@ -1,11 +1,11 @@
 {
-  "name": "@wweiyi/expert-tui",
+  "name": "@wweiyi/expert",
   "version": "0.2.0",
   "private": true,
   "description": "Expert TUI standalone terminal assistant",
   "license": "SEE LICENSE IN LICENSE",
   "bin": {
-    "expert-tui": "bin/expert.cjs"
+    "expert": "bin/expert.cjs"
   },
   "files": [
     "bin",
@@ -28,6 +28,15 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wweiyi2004/expert_tui.git",
+    "directory": "npm/expert"
+  },
+  "homepage": "https://github.com/wweiyi2004/expert_tui#readme",
+  "bugs": {
+    "url": "https://github.com/wweiyi2004/expert_tui/issues"
   },
   "scripts": {
     "test": "node --test test/*.test.cjs"

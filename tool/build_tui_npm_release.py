@@ -59,7 +59,7 @@ def main():
     scope = (scope or 'expert-tui-preview').removeprefix('@')
     if not re.fullmatch(r'[a-z0-9][a-z0-9._-]*', scope):
         raise ValueError('Invalid npm scope')
-    name = f'@{scope}/expert-tui'
+    name = f'@{scope}/expert'
     if not args.skip_build:
         run(['python', 'tool/build_native.py'])
     media = ROOT / 'output/native/expert-media-worker'

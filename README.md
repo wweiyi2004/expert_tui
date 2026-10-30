@@ -27,9 +27,9 @@ python tool/build_native.py
 python tool/build_tui_npm_release.py --draft --skip-build
 ```
 
-产物位于 `output/releases/`，包含便携 ZIP、npm TGZ 和校验清单。解压 ZIP 后运行 `expert.cmd`。从 TGZ 安装时命令为 `expert-tui`，避免覆盖原项目的 `expert` 命令。
+产物位于 `output/releases/`，包含便携 ZIP、npm TGZ 和校验清单。解压 ZIP 后运行 `expert.cmd`。从 TGZ 安装时继续使用原来的 `expert` 命令。
 
-新包身份为 `@wweiyi/expert-tui`，尚未由本次迁移发布。`--draft` 生成 private 包；正式发布需另行安排。更新器只查询自身包名，不会安装 `@wweiyi/expert` 的旧发行包。
+沿用已发布的 `@wweiyi/expert` 包身份，让旧用户继续通过 `expert update` 更新。版本保留 `0.2.0`，本次只准备发布流程，不发布新版本。GitHub 普通源码推送不会发布 npm；后续升版本、创建对应标签并发布 GitHub Release 后才触发发布。详见 [npm 发布流程](docs/NPM-RELEASE.md)。
 
 ## 数据与配置
 
