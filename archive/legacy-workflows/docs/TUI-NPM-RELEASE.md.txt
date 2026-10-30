@@ -1,0 +1,64 @@
+# 独立 TUI npm 发行与更新
+
+实现版本：`0.2.0`，Windows x64。包内只有 TUI、独立 Dart Host、文件工具、
+文档媒体 worker 和数学工具脚本，没有 GUI、Flutter 引擎、用户资料或凭据。
+需要 Node.js 20+，本次完整验收使用隔离下载并核对官方摘要的 Node.js 22.23.4。
+没有替换系统 Node 或改变用户的 npm registry。正式发布后安装了已验证的
+每用户 Node 22 运行时，并将 `expert` 入口切换至 npm 包。
+
+正式发布：[@wweiyi/expert@0.2.0](https://www.npmjs.com/package/@wweiyi/expert/v/0.2.0)。
+官方 registry 的版本、latest 标签、tarball SHA-512 均已复核；从公开下载地址
+安装后再次校验完整文件清单，PowerShell/CMD 启动、离线绘制和官方更新检查通过。
+当前打开的旧 TUI/Host 没有被停止，新启动使用 npm 版。
+
+## 用户入口
+
+| 入口 | 行为 |
+| --- | --- |
+| `expert --version` / `expert version` | 离线查询当前激活版本 |
+| `expert version --json` | 返回包名、版本、平台 |
+| `expert update --check` | 只检查官方 npm 的 `latest` |
+| `expert update` | 下载、校验、安装；下次启动生效 |
+| `/version` | TUI 内显示运行中版本 |
+| `/update check` | TUI 内异步检查 |
+| `/update` / `/update install` | TUI 内异步升级，当前会话与 Host 继续运行 |
+
+npm 启动器把运行文件复制到用户版本缓存，避免 Windows 的 EXE 文件锁。
+新版本的 JS 和原生组件一起安装，完整验证后原子切换指针。旧版本保留，
+网络故障或校验失败不激活未完成的包；升级不接管或重放原任务。
+
+## 构建与发布
+
+- [包源码](../npm/expert/)：没有 npm 运行时依赖或安装生命周期脚本。
+- [构建工具](../tool/build_tui_npm_release.py)：同步核对 Rust/npm 版本、编译原生
+  组件，以明确文件白名单分离 TUI；生成 tgz、便携 ZIP、101 项文件清单及摘要。
+- [使用与发布说明](../scripts/EXPERT-TUI.md)。
+
+构建还通过 Python 独立核对 npm 的 SHA-512、gzip/tar 内容及每个文件 SHA-256。
+正式包使用 `@wweiyi/expert` 和 public access。登录前生成的
+`@expert-chat-preview/expert` 私有预览保留为历史构建；正式包已重新命名、
+生成摘要并重新通过实际安装和升级验收，不使用临时作用域作为正式更新源。
+
+## 验收
+
+- Node 单元回归 7 项：版本比较、离线查询、只读检查、完整升级与新启动器分派、
+  损坏下载和离线失败保留当前版本、并发保护、registry 身份检查。
+- Rust 传输回归 10 项、本地更新命令 1 项、CLI 参数回归 3 项通过。
+- 实际 npm 安装到含空格的隔离 global prefix，生成 `expert.cmd`，运行真实
+  原生 TUI 离线快照；实际 npm 从回环 registry 下载、核验和切换新版。
+- 同时保持一个真实旧 Host 进程运行，EXE 被锁定时升级仍通过，旧 Host 继续运行。
+- 独立 Host 的资料锁、双客户端、历史持久化、进程中断恢复和不重放验收通过。
+- 便携 ZIP 解压后 `expert.cmd --version` 和离线绘制通过。
+- 所有模型请求仅使用回环合成服务，没有付费请求，也没有发布或修改生产资料。
+
+本机 Node 24.14.1/npm 11.11.0 在实际验收时偶发解压校验失败，同一 tarball
+用 Python 和 Node 独立校验有效，Node 22 的完整流程通过。因此建议 Node 22；
+更新器对此类错误保留当前版本并给出反馈。上游有
+[类似的 Node/Windows 解压问题报告](https://github.com/nodejs/node/issues/66465)，
+不能据此确认本机与该报告具有相同根因。
+
+正式产物及机器可读验收报告位于
+`output/releases/expert-npm-0.2.0-20261029-025026/`。其中
+`registry-verified.json` 记录公开 tarball 身份与摘要复核，
+`publication-verified.json` 记录正式发布和本机安装验证。
+当前构建索引为 `output/tui-npm-build/latest.json`。

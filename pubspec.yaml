@@ -1,0 +1,34 @@
+name: expert_tui
+description: Independent terminal assistant and pure Dart task runtime.
+version: 0.2.0
+publish_to: none
+environment:
+  sdk: ^3.12.0
+dependencies:
+  archive: 3.6.1
+  characters: 1.4.1
+  crypto: 3.0.7
+  dartssh2: 2.22.4
+  dio: 5.9.2
+  docx_to_text: 1.0.1
+  drift: 2.33.0
+  excel: 4.0.6
+  ffi: 2.2.0
+  html: 0.15.6
+  jose: 0.3.5+2
+  meta: 1.18.0
+  mime: 2.0.0
+  path: 1.9.1
+  pointycastle: 4.0.0
+  riverpod: 3.2.1
+  sqlite3: 3.3.2
+  stream_channel: 2.1.4
+  uuid: 4.5.3
+  win32: 5.15.0
+  xml: 6.6.1
+  xterm:
+    path: third_party/xterm
+dev_dependencies:
+  test: 1.31.0
+  drift_dev: 2.33.0
+  build_runner: 2.15.0

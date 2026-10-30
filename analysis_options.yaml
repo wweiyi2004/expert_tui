@@ -1,0 +1,4 @@
+analyzer:
+  exclude:
+    - third_party/**
+    - output/**

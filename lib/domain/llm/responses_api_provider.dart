@@ -1,0 +1,760 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+import 'package:uuid/uuid.dart';
+
+import '../../data/models.dart';
+import 'llm_http_errors.dart';
+import 'llm_endpoint.dart';
+import 'llm_provider.dart';
+import 'llm_request_policy.dart';
+import 'auth/chatgpt_network.dart';
+
+/// OpenAI-compatible **Responses API** client (`POST /responses`).
+///
+/// Selected explicitly, discovered by auto routing, or used for hosted search.
+/// Client function tools work independently of hosted web_search.
+class ResponsesApiProvider implements LlmProvider {
+  ResponsesApiProvider({
+    Dio? dio,
+    this.responseHeaderTimeout = const Duration(seconds: 30),
+  }) : _dio =
+           dio ?? Dio(BaseOptions(connectTimeout: const Duration(seconds: 30)));
+
+  final Dio _dio;
+  final Duration responseHeaderTimeout;
+
+  static const _streamIdleTimeout = Duration(seconds: 90);
+  static const _uuid = Uuid();
+
+  @override
+  Stream<ChatChunk> streamChat({
+    required LlmConfig config,
+    required List<LlmRequestMessage> messages,
+    List<ToolSpec>? tools,
+    bool? thinking,
+    ReasoningEffort? reasoningEffort,
+    String? forceToolName,
+    CancelToken? cancelToken,
+  }) async* {
+    final headerTimeout = config.responseHeaderTimeout ?? responseHeaderTimeout;
+    if (cancelToken?.isCancelled ?? false) return;
+    if (config.authMode == 'chatgpt') await configureChatGptNetwork(_dio);
+    final url = LlmEndpoint.action(config.baseUrl, 'responses');
+
+    final built = _buildRequest(
+      config: config,
+      messages: messages,
+      tools: tools,
+      thinking: thinking,
+      reasoningEffort: reasoningEffort,
+      forceToolName: forceToolName,
+    );
+
+    final Response<ResponseBody> response;
+    // Timing out the await alone leaves the socket open: the server keeps
+    // generating (and billing) a response nobody reads. Route the request
+    // through a token linked to the caller's so the timeout — or stop() —
+    // actually aborts the connection.
+    final requestToken = CancelToken();
+    unawaited(
+      cancelToken?.whenCancel.then(
+        (e) => requestToken.cancel(e.error ?? e.message ?? 'cancelled'),
+      ),
+    );
+    try {
+      response = await _dio
+          .post<ResponseBody>(
+            url,
+            options: Options(
+              responseType: ResponseType.stream,
+              headers: {
+                ...config.transportHeaders,
+                if (config.authMode != 'none' &&
+                    config.apiKey.trim().isNotEmpty)
+                  'Authorization': 'Bearer ${config.apiKey}',
+                'Content-Type': 'application/json',
+                'Accept': 'text/event-stream',
+              },
+            ),
+            data: jsonEncode(built),
+            onSendProgress:config.onUploadProgress,
+            cancelToken: requestToken,
+          )
+          .timeout(
+            headerTimeout,
+            onTimeout: () {
+              requestToken.cancel('响应超时');
+              throw TimeoutException('响应头等待超时', headerTimeout);
+            },
+          );
+    } on DioException catch (e) {
+      if (CancelToken.isCancel(e)) return;
+      throw await humanizeLlmHttpError(
+        e,
+        authMode: config.authMode,
+        notFoundMessage:
+            '接口未找到（404）：当前 Base URL 可能不支持 Responses API（/responses）。',
+      );
+    } on TimeoutException {
+      if (cancelToken?.isCancelled ?? false) return;
+      throw llmResponseTimeout(headerTimeout);
+    }
+
+    if (response.headers.value('content-type')?.toLowerCase().contains('text/html') ?? false) {
+      throw FormatException('服务返回了网页（HTTP ${response.statusCode}），不是模型流式接口。请检查 Base URL、/v1 等版本路径和接口协议。');
+    }
+
+    final byteStream = response.data!.stream
+        .cast<List<int>>()
+        .transform(
+          StreamTransformer.fromBind(
+            const Utf8Decoder(allowMalformed: true).bind,
+          ),
+        )
+        .transform(const LineSplitter())
+        .timeout(_streamIdleTimeout);
+
+    // Responses SSE uses `event:` + `data:` pairs (not Chat Completions'
+    // bare `data:` lines). Buffer until a blank line ends the event.
+    String? pendingEvent;
+    final pendingData = <String>[];
+    final outputItems = <Map<String, dynamic>>[];
+    final functionDrafts = <String, _FunctionCallDraft>{};
+    final citations = <Citation>[];
+    final seenCitationUrls = <String>{};
+    // Stable activity ids per output item so searching → completed updates
+    // the same search panel row.
+    final searchActivityIds = <String, String>{};
+    var sawFunctionCall = false;
+    String? terminalFinishReason;
+
+    List<ChatChunk> consumeEvent(String? eventType, Map<String, dynamic> json) {
+      final type = eventType ?? json['type'] as String?;
+      final response = json['response'];
+      if (type == 'response.failed') {
+        final error = response is Map ? response['error'] : json['error'];
+        throw Exception(_errorFromDynamic(error) ?? 'Responses 请求失败');
+      }
+      if (type == 'response.completed') {
+        terminalFinishReason = 'stop';
+      } else if (type == 'response.incomplete') {
+        final details = response is Map ? response['incomplete_details'] : null;
+        terminalFinishReason = switch (details is Map
+            ? details['reason']
+            : null) {
+          'max_output_tokens' => 'max_output_tokens',
+          'content_filter' => 'content_filter',
+          _ => 'incomplete',
+        };
+      }
+      return _handleEvent(
+        eventType: eventType,
+        json: json,
+        outputItems: outputItems,
+        functionDrafts: functionDrafts,
+        citations: citations,
+        seenCitationUrls: seenCitationUrls,
+        searchActivityIds: searchActivityIds,
+        onFunctionCall: () => sawFunctionCall = true,
+      );
+    }
+
+    try {
+      await for (final line in byteStream) {
+        if (line.isEmpty) {
+          if (pendingData.isEmpty && pendingEvent == null) continue;
+          final payload = pendingData.join('\n');
+          final eventType = pendingEvent;
+          pendingEvent = null;
+          pendingData.clear();
+          if (payload.isEmpty) continue;
+
+          final json = _tryDecodeJson(payload);
+          if (json == null) continue;
+
+          for (final chunk in consumeEvent(eventType, json)) {
+            yield chunk;
+          }
+          if (terminalFinishReason != null) break;
+          continue;
+        }
+
+        if (line.startsWith('event:')) {
+          pendingEvent = line.substring(6).trim();
+          continue;
+        }
+        if (line.startsWith('data:')) {
+          pendingData.add(line.substring(5).trimLeft());
+          continue;
+        }
+      }
+
+      // Flush a trailing event if the server closed without a blank line.
+      if (terminalFinishReason == null &&
+          (pendingData.isNotEmpty || pendingEvent != null)) {
+        final payload = pendingData.join('\n');
+        final json = _tryDecodeJson(payload);
+        if (json != null) {
+          for (final chunk in consumeEvent(pendingEvent, json)) {
+            yield chunk;
+          }
+        }
+      }
+    } on DioException catch (e) {
+      if (CancelToken.isCancel(e)) return;
+      throw await humanizeLlmHttpError(
+        e,
+        authMode: config.authMode,
+        notFoundMessage:
+            '接口未找到（404）：当前 Base URL 可能不支持 Responses API（/responses）。',
+      );
+    } on TimeoutException {
+      if (cancelToken?.isCancelled ?? false) return;
+      throw llmResponseTimeout(_streamIdleTimeout, headers: false);
+    }
+
+    if (terminalFinishReason == null) {
+      throw Exception('响应流在完成前中断，请重试。');
+    }
+    // An incomplete function call must never be executed, even if its partial
+    // arguments happen to parse. Preserve the provider's terminal reason.
+    if (sawFunctionCall && terminalFinishReason == 'stop') {
+      final calls =
+          functionDrafts.values
+              .map((d) => d.toToolCall())
+              .where((c) => (c.name ?? '').isNotEmpty)
+              .toList()
+            ..sort((a, b) => a.index.compareTo(b.index));
+      yield ChatChunk(
+        toolCalls: calls.isEmpty ? null : calls,
+        finishReason: 'tool_calls',
+        citations: citations.isEmpty ? null : List.unmodifiable(citations),
+        responseOutputItems: List<Map<String, dynamic>>.unmodifiable(
+          outputItems.map((e) => Map<String, dynamic>.from(e)),
+        ),
+      );
+    } else {
+      yield ChatChunk(
+        finishReason: terminalFinishReason,
+        citations: citations.isEmpty ? null : List.unmodifiable(citations),
+        responseOutputItems: outputItems.isEmpty
+            ? null
+            : List<Map<String, dynamic>>.unmodifiable(
+                outputItems.map((e) => Map<String, dynamic>.from(e)),
+              ),
+      );
+    }
+  }
+
+  Map<String, dynamic> _buildRequest({
+    required LlmConfig config,
+    required List<LlmRequestMessage> messages,
+    List<ToolSpec>? tools,
+    bool? thinking,
+    ReasoningEffort? reasoningEffort,
+    String? forceToolName,
+  }) {
+    final instructions = StringBuffer();
+    final input = <Map<String, dynamic>>[];
+
+    for (final message in messages) {
+      if (message.isEmptyAssistant) continue;
+      if (message.responseOutputItems.isNotEmpty) {
+        for (final item in message.responseOutputItems) {
+          if (_emptyAssistantItem(item)) continue;
+          input.add(Map<String, dynamic>.from(item));
+        }
+        continue;
+      }
+
+      switch (message.role) {
+        case MessageRole.system:
+          if (message.content.trim().isNotEmpty) {
+            if (instructions.isNotEmpty) instructions.writeln();
+            instructions.write(message.content);
+          }
+        case MessageRole.user:
+          input.add({
+            'type': 'message',
+            'role': 'user',
+            'content': !message.hasImageParts
+                ? message.content
+                : [
+                    if (message.content.isNotEmpty)
+                      {'type': 'input_text', 'text': message.content},
+                    for (final id in message.imageFileIds)
+                      {'type': 'input_image', 'file_id': id},
+                    for (final url in message.imageDataUrls)
+                      {'type': 'input_image', 'image_url': url},
+                  ],
+          });
+        case MessageRole.assistant:
+          if (message.reasoningContent != null &&
+              message.reasoningContent!.trim().isNotEmpty) {
+            input.add({
+              'type': 'reasoning',
+              'content': [
+                {'type': 'reasoning_text', 'text': message.reasoningContent},
+              ],
+            });
+          }
+          if (message.toolCalls.isNotEmpty) {
+            for (final call in message.toolCalls) {
+              input.add({
+                'type': 'function_call',
+                'call_id': call.id ?? 'call_${call.index}',
+                'name': call.name ?? '',
+                'arguments': call.argumentsJson,
+              });
+            }
+          } else if (message.content.trim().isNotEmpty) {
+            input.add({
+              'type': 'message',
+              'role': 'assistant',
+              'content': [
+                {'type': 'output_text', 'text': message.content},
+              ],
+            });
+          }
+        case MessageRole.tool:
+          input.add({
+            'type': 'function_call_output',
+            'call_id': message.toolCallId ?? '',
+            'output': message.content,
+          });
+      }
+    }
+
+    final body = <String, dynamic>{
+      'model': config.model,
+      'stream': true,
+      if (config.authMode == 'chatgpt') 'store': false,
+      if (config.maxOutputTokens != null && config.authMode != 'chatgpt')
+        'max_output_tokens': config.maxOutputTokens,
+      if (instructions.isNotEmpty) 'instructions': instructions.toString(),
+      if (input.isNotEmpty) 'input': input,
+      if (config.serviceTier != null && config.supportsPriorityTier)
+        'service_tier': config.serviceTier,
+    };
+
+    if (thinking != null && config.capabilities.supportsReasoningEffort) {
+      if (thinking ||
+          (!config.capabilities.reasoningCanBeDisabled &&
+              !config.capabilities.sendThinkingField)) {
+        final effort = reasoningEffortWire(
+          config,
+          reasoningEffort ?? ReasoningEffort.high,
+        );
+        body['reasoning'] = {'effort': effort};
+        if (config.capabilities.sendThinkingField) {
+          body['output_config'] = {'effort': effort};
+        }
+      } else if (config.capabilities.reasoningCanBeDisabled) {
+        body['reasoning'] = {'effort': 'none'};
+      }
+    }
+
+    final toolList = <Map<String, dynamic>>[];
+    if (config.useServerWebSearch) {
+      toolList.add({'type': 'web_search'});
+    }
+    if (LlmRequestPolicy.canUseTools(config, tools)) {
+      for (final tool in tools!) {
+        // Client web_search is replaced by the hosted tool when server search
+        // is on; keep fetch_url / generate_image as functions.
+        if (config.useServerWebSearch && tool.name == 'web_search') continue;
+        toolList.add({
+          'type': 'function',
+          'name': tool.name,
+          'description': tool.description,
+          'parameters': tool.parameters,
+        });
+      }
+    }
+    if (toolList.isNotEmpty) {
+      body['tools'] = config.authMode == 'chatgpt'
+          ? [
+              ...toolList.where((tool) => tool['type'] != 'function'),
+              if (toolList.any((tool) => tool['type'] == 'function'))
+                {
+                  'type': 'namespace',
+                  'name': 'expert_chat',
+                  'description': 'Expert Chat 的会话和工作区工具',
+                  'tools': toolList
+                      .where((tool) => tool['type'] == 'function')
+                      .toList(),
+                },
+            ]
+          : toolList;
+      final force = forceToolName?.trim() ?? '';
+      if (force == kToolChoiceRequired) {
+        body['tool_choice'] = 'required';
+      } else if (force.isNotEmpty) {
+        body['tool_choice'] = {
+          'type': 'function',
+          'name': force,
+          if (config.authMode == 'chatgpt') 'namespace': 'expert_chat',
+        };
+      } else if (config.useServerWebSearch && config.forceServerWebSearch) {
+        body['tool_choice'] = {'type': 'web_search'};
+      } else {
+        body['tool_choice'] = 'auto';
+      }
+    }
+
+    if (body['input'] == null && body['instructions'] == null) {
+      body['input'] = ' ';
+    }
+    return body;
+  }
+
+  List<ChatChunk> _handleEvent({
+    required String? eventType,
+    required Map<String, dynamic> json,
+    required List<Map<String, dynamic>> outputItems,
+    required Map<String, _FunctionCallDraft> functionDrafts,
+    required List<Citation> citations,
+    required Set<String> seenCitationUrls,
+    required Map<String, String> searchActivityIds,
+    required void Function() onFunctionCall,
+  }) {
+    final type = eventType ?? json['type'] as String? ?? '';
+    final out = <ChatChunk>[];
+
+    switch (type) {
+      case 'response.reasoning_text.delta':
+        final delta = json['delta'] as String?;
+        if (delta != null && delta.isNotEmpty) {
+          out.add(ChatChunk(reasoningDelta: delta));
+        }
+      case 'response.output_text.delta':
+        final delta = json['delta'] as String?;
+        if (delta != null && delta.isNotEmpty) {
+          out.add(ChatChunk(contentDelta: delta));
+        }
+      case 'response.function_call_arguments.delta':
+        onFunctionCall();
+        final itemId = json['item_id'] as String? ?? '';
+        final delta = json['delta'] as String? ?? '';
+        final draft = functionDrafts.putIfAbsent(
+          itemId,
+          () => _FunctionCallDraft(index: functionDrafts.length),
+        );
+        draft.arguments.write(delta);
+      case 'response.function_call_arguments.done':
+        onFunctionCall();
+        final itemId = json['item_id'] as String? ?? '';
+        final draft = functionDrafts.putIfAbsent(
+          itemId,
+          () => _FunctionCallDraft(index: functionDrafts.length),
+        );
+        final args = json['arguments'] as String?;
+        if (args != null && args.isNotEmpty && draft.arguments.isEmpty) {
+          draft.arguments.write(args);
+        }
+        draft.name ??= json['name'] as String?;
+        draft.callId ??= json['call_id'] as String?;
+      case 'response.output_item.added':
+      case 'response.output_item.done':
+        final item = json['item'];
+        if (item is Map<String, dynamic>) {
+          _upsertOutputItem(outputItems, item);
+          final itemType = item['type'] as String?;
+          if (itemType == 'function_call') {
+            onFunctionCall();
+            final itemId = item['id'] as String? ?? '';
+            final draft = functionDrafts.putIfAbsent(
+              itemId,
+              () => _FunctionCallDraft(index: functionDrafts.length),
+            );
+            draft.callId ??= item['call_id'] as String?;
+            draft.name ??= item['name'] as String?;
+            final args = item['arguments'] as String?;
+            if (args != null && args.isNotEmpty && draft.arguments.isEmpty) {
+              draft.arguments.write(args);
+            }
+          }
+          if (itemType == 'web_search_call' &&
+              type == 'response.output_item.done') {
+            final activity = _activityFromWebSearchItem(
+              item,
+              searchActivityIds,
+              completed: true,
+            );
+            if (activity != null) {
+              out.add(ChatChunk(serverSearchActivity: activity));
+            }
+            _collectCitationsFromWebSearch(item, citations, seenCitationUrls);
+          }
+          if (itemType == 'message') {
+            _collectCitationsFromMessage(item, citations, seenCitationUrls);
+          }
+        }
+      case 'response.web_search_call.in_progress':
+      case 'response.web_search_call.searching':
+      case 'response.web_search_call.completed':
+        final itemId =
+            json['item_id'] as String? ??
+            json['output_index']?.toString() ??
+            type;
+        final query = _queryFromWebSearchEvent(json);
+        final id = searchActivityIds.putIfAbsent(itemId, _uuid.v4);
+        final completed = type == 'response.web_search_call.completed';
+        out.add(
+          ChatChunk(
+            serverSearchActivity: SearchActivity(
+              id: id,
+              kind: SearchActivityKind.search,
+              query: query.isEmpty ? '官方联网搜索' : query,
+              status: completed
+                  ? SearchActivityStatus.done
+                  : SearchActivityStatus.running,
+              resultCount: completed ? _resultCountFromWebSearchEvent(json) : 0,
+            ),
+          ),
+        );
+      case 'response.completed':
+      case 'response.incomplete':
+        final response = json['response'];
+        if (response is Map<String, dynamic>) {
+          final usage = LlmUsage.fromResponses(response['usage']);
+          if (usage != null) out.add(ChatChunk(usage: usage));
+          final output = response['output'];
+          if (output is List) {
+            for (final raw in output) {
+              if (raw is Map<String, dynamic>) {
+                _upsertOutputItem(outputItems, raw);
+                if (raw['type'] == 'function_call') onFunctionCall();
+                if (raw['type'] == 'web_search_call') {
+                  _collectCitationsFromWebSearch(
+                    raw,
+                    citations,
+                    seenCitationUrls,
+                  );
+                }
+                if (raw['type'] == 'message') {
+                  _collectCitationsFromMessage(
+                    raw,
+                    citations,
+                    seenCitationUrls,
+                  );
+                }
+              }
+            }
+          }
+        }
+      case 'response.failed':
+        // Handled by the caller after this returns.
+        break;
+      default:
+        break;
+    }
+
+    if (citations.isNotEmpty &&
+        (type == 'response.completed' ||
+            type == 'response.incomplete' ||
+            type == 'response.output_item.done')) {
+      out.add(ChatChunk(citations: List.unmodifiable(citations)));
+    }
+    return out;
+  }
+
+  static void _upsertOutputItem(
+    List<Map<String, dynamic>> items,
+    Map<String, dynamic> item,
+  ) {
+    final id = item['id'] as String?;
+    if (id != null && id.isNotEmpty) {
+      final index = items.indexWhere((e) => e['id'] == id);
+      if (index >= 0) {
+        items[index] = Map<String, dynamic>.from(item);
+        return;
+      }
+    }
+    items.add(Map<String, dynamic>.from(item));
+  }
+
+  static SearchActivity? _activityFromWebSearchItem(
+    Map<String, dynamic> item,
+    Map<String, String> searchActivityIds, {
+    required bool completed,
+  }) {
+    final itemId = item['id'] as String? ?? '';
+    final id = searchActivityIds.putIfAbsent(
+      itemId.isEmpty ? _uuid.v4() : itemId,
+      _uuid.v4,
+    );
+    final query = _queryFromAction(item['action']);
+    return SearchActivity(
+      id: id,
+      kind: SearchActivityKind.search,
+      query: query.isEmpty ? '官方联网搜索' : query,
+      status: completed
+          ? SearchActivityStatus.done
+          : SearchActivityStatus.running,
+      resultCount: completed ? _sourcesFromAction(item['action']).length : 0,
+    );
+  }
+
+  static String _queryFromWebSearchEvent(Map<String, dynamic> json) {
+    final fromAction = _queryFromAction(json['action']);
+    if (fromAction.isNotEmpty) return fromAction;
+    final item = json['item'];
+    if (item is Map) return _queryFromAction(item['action']);
+    final query = json['query'];
+    return query is String ? query.trim() : '';
+  }
+
+  static int _resultCountFromWebSearchEvent(Map<String, dynamic> json) {
+    final fromAction = _sourcesFromAction(json['action']);
+    if (fromAction.isNotEmpty) return fromAction.length;
+    final item = json['item'];
+    if (item is Map) return _sourcesFromAction(item['action']).length;
+    final n = json['result_count'] ?? json['resultCount'];
+    if (n is num) return n.toInt();
+    return 0;
+  }
+
+  static String _queryFromAction(dynamic action) {
+    if (action is! Map) return '';
+    final query = action['query'];
+    if (query is String && query.trim().isNotEmpty) return query.trim();
+    final queries = action['queries'];
+    if (queries is List) {
+      return queries
+          .map((e) => e.toString().trim())
+          .where((e) => e.isNotEmpty)
+          .join(' / ');
+    }
+    return '';
+  }
+
+  static List<({String title, String url, String snippet})> _sourcesFromAction(
+    dynamic action,
+  ) {
+    if (action is! Map) return const [];
+    final out = <({String title, String url, String snippet})>[];
+    for (final key in const ['sources', 'results', 'data']) {
+      final list = action[key];
+      if (list is! List) continue;
+      for (final raw in list) {
+        if (raw is! Map) continue;
+        final url = (raw['url'] as String? ?? raw['link'] as String? ?? '')
+            .trim();
+        if (url.isEmpty) continue;
+        out.add((
+          title: (raw['title'] as String? ?? raw['name'] as String? ?? url)
+              .trim(),
+          url: url,
+          snippet:
+              (raw['snippet'] as String? ?? raw['content'] as String? ?? '')
+                  .trim(),
+        ));
+      }
+    }
+    return out;
+  }
+
+  static void _collectCitationsFromWebSearch(
+    Map<String, dynamic> item,
+    List<Citation> citations,
+    Set<String> seen,
+  ) {
+    for (final source in _sourcesFromAction(item['action'])) {
+      if (!seen.add(source.url)) continue;
+      citations.add(
+        Citation(
+          index: citations.length + 1,
+          title: source.title,
+          url: source.url,
+          snippet: source.snippet,
+        ),
+      );
+    }
+  }
+
+  static void _collectCitationsFromMessage(
+    Map<String, dynamic> item,
+    List<Citation> citations,
+    Set<String> seen,
+  ) {
+    final content = item['content'];
+    if (content is! List) return;
+    for (final part in content) {
+      if (part is! Map) continue;
+      final annotations = part['annotations'];
+      if (annotations is! List) continue;
+      for (final raw in annotations) {
+        if (raw is! Map) continue;
+        final type = raw['type'] as String? ?? '';
+        if (type != 'url_citation' && type != 'citation') continue;
+        final url = (raw['url'] as String? ?? '').trim();
+        if (url.isEmpty || !seen.add(url)) continue;
+        citations.add(
+          Citation(
+            index: citations.length + 1,
+            title: (raw['title'] as String? ?? url).trim(),
+            url: url,
+            snippet: (raw['snippet'] as String? ?? '').trim(),
+          ),
+        );
+      }
+    }
+  }
+
+  Map<String, dynamic>? _tryDecodeJson(String payload) {
+    try {
+      final decoded = jsonDecode(payload);
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _errorFromDynamic(dynamic error) {
+    if (error is Map) {
+      final message = error['message'] ?? error['detail'];
+      if (message is String && message.trim().isNotEmpty) {
+        return clipLlmErrorMessage(message);
+      }
+    }
+    if (error is String && error.trim().isNotEmpty) {
+      return clipLlmErrorMessage(error);
+    }
+    return null;
+  }
+}
+
+bool _emptyAssistantItem(Map<String,dynamic> item){
+  if(item['type']!='message'||item['role']!='assistant')return false;
+  final content=item['content'];
+  if(content is String)return content.trim().isEmpty;
+  if(content==null)return true;
+  if(content is! List)return false;
+  return content.every((part){
+    if(part is String)return part.trim().isEmpty;
+    if(part is! Map)return part==null;
+    if({'text','input_text','output_text','refusal'}.contains(part['type'])){
+      return (part['text'] as String? ?? part['refusal'] as String? ?? '').trim().isEmpty;
+    }
+    return part.isEmpty;
+  });
+}
+
+class _FunctionCallDraft {
+  _FunctionCallDraft({required this.index});
+
+  final int index;
+  String? callId;
+  String? name;
+  final StringBuffer arguments = StringBuffer();
+
+  ToolCall toToolCall() => ToolCall(
+    index: index,
+    id: callId ?? 'call_$index',
+    name: name,
+    argumentsJson: arguments.toString(),
+  );
+}

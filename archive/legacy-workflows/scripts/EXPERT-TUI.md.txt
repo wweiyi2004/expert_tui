@@ -1,0 +1,74 @@
+# Expert TUI 安装、版本和更新
+
+独立发行包包含 Rust TUI、Dart Host、文件工具、文档媒体 worker，不含 GUI
+或 Flutter 引擎。当前支持 Windows x64，要求 Node.js 20+（包含 npm）。
+
+## 安装和使用
+
+正式包名为 `@wweiyi/expert`，已发布版本 `0.2.0`：
+
+```powershell
+npm install -g @wweiyi/expert --registry=https://registry.npmjs.org
+expert
+expert --version
+expert version --json
+expert update --check
+expert update
+```
+
+`expert update` 自动检查并安装最新稳定版本，下次启动生效。`--check` 只检查。
+应用内 `/update` 执行同一升级流程，`/update check` 只检查，`/version` 查看版本。
+升级不会关闭当前 TUI/Host 或重放任务。活动 Host 可继续服务其他客户端，
+下次启动时按宿主的活动状态和兼容性规则连接。
+
+如果旧的 `%USERPROFILE%/.local/bin/expert.cmd` 在 PATH 中遮挡 npm 命令，
+需将旧入口备份，或改为调用 npm 包的 `bin/expert.cjs`。
+使用 `Get-Command expert -All` 检查入口。打包与本地验收不会自行改变用户入口。
+
+便携 ZIP 解压后运行 `expert.cmd`，同样需要 Node.js。不能只复制一个 EXE，
+更新器和 Host 随完整独立包分发。启动器保留当前项目目录和退出码。
+`expert --demo welcome` / `expert --snapshot welcome` 可离线运行，不发起付费请求。
+
+## 更新机制
+
+- npm 与 Rust Cargo 版本一致，首个独立 npm 版本为 `0.2.0`。
+- 默认查询官方 npm registry 中相同作用域的 `latest`。
+  `EXPERT_UPDATE_REGISTRY` 可配置 HTTPS 源；仅回环测试允许 HTTP。
+- npm 下载锁定确切版本并禁用生命周期脚本；随后校验包名、版本、文件清单
+  和 SHA-256，成功后才切换指针。
+- 可执行程序和 JS 位于 `%LOCALAPPDATA%/expert-chat/cli` 的独立版本目录，
+  npm 自身更新时不会覆盖运行中的 EXE。旧目录保留，新启动器使用激活版本。
+- 网络失败、未发布、并发更新、损坏文件均有明确反馈，不激活未完成版本。
+- `EXPERT_CLI_HOME` 可指定版本缓存的绝对路径。模型密钥、会话和授权沿用
+  应用原用户目录，不放入安装包或版本缓存。
+
+## 构建和发布
+
+```powershell
+npm login --registry=https://registry.npmjs.org --auth-type=web
+npm whoami --registry=https://registry.npmjs.org
+python tool/build_tui_npm_release.py --scope 你的npm用户名
+node tool/test_tui_npm_release.cjs
+```
+
+构建脚本在 `output/releases/expert-npm-版本-时间/` 生成 npm `.tgz`、便携 `.zip`、
+文件摘要和 `release.json`。没有账号时可用 `--draft` 生成 `private: true`
+本地预览包；预览包不可发布，临时作用域不能作为正式更新源。
+
+完整检查后发布具体 tarball：
+
+```powershell
+npm publish "生成的包.tgz" --access public --registry=https://registry.npmjs.org --ignore-scripts
+```
+
+后续同步递增 `next/tui/Cargo.toml` 和 `npm/expert/package.json` 的版本后构建发布。
+npm 同名同版本不能覆盖；`latest` 指向新稳定版本后，两个更新入口会获取它。
+
+发布后应从官方 registry 复核版本、latest 和摘要，再执行真实安装检查。
+若 registry 仅显示 `0.0.0-stage`，表示待批准的占位版本，需要完成 npm 的
+[staged publishing](https://docs.npmjs.com/staged-publishing/) 批准流程；
+npm 11.15+ 提供 `npm stage list`、`npm stage view`、`npm stage approve`。
+不能仅根据旧版 CLI 的成功输出判断包已公开。
+
+本包保留根目录 LICENSE。图形客户端、GUI 语音/设备能力不在本包中，
+音视频提取需另外安装 ffmpeg/ffprobe。

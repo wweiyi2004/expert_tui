@@ -1,0 +1,1898 @@
+import '../../domain/llm/stream_token_meter.dart';
+import '../../domain/chat/task_window.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:dio/dio.dart';
+import 'package:crypto/crypto.dart';
+import 'package:riverpod/riverpod.dart';
+import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
+import 'package:archive/archive.dart';
+import '../../domain/update/update_downloader.dart';
+import '../../domain/media/image_edit_reference.dart';
+import '../../core/desktop_providers.dart';
+import '../../data/models.dart';
+import '../../domain/desktop/workspace_host.dart';
+import '../../domain/desktop/workspace_identity.dart';
+import '../../domain/desktop/workspace_tools.dart';
+import '../../domain/desktop/workspace_health_check.dart';
+import '../../state/work_project_memory.dart';
+import '../../state/work_runtime_logs.dart';
+import '../../domain/host/terminal_output.dart';
+import '../../domain/llm/llm_provider.dart';
+import '../../domain/workbench/changes/line_diff.dart';
+import '../../state/chat_controller.dart';
+import '../../state/conversation_model_choice.dart';
+import '../../state/conversation_workspace_bindings.dart';
+import '../../state/model_route_groups.dart';
+import '../../state/model_service_credentials.dart';
+import '../../state/session_policy.dart';
+import '../../state/settings_controller.dart';
+import '../../state/task_acceptance_provider.dart';
+import '../../state/task_plans.dart';
+import '../../state/task_overview.dart';
+import '../../state/work_agents.dart';
+import '../../state/work_approvals.dart';
+import '../../state/work_changes.dart';
+import '../../state/work_questions.dart';
+import '../../state/work_rounds.dart';
+import '../../state/work_task_steering.dart';
+import '../../state/work_session_insights.dart';
+import '../../state/research_terminal_controller.dart';
+import '../../state/work_task_runtime.dart';
+import 'protocol.dart';
+import 'gui_actions.dart';
+import 'snapshot_evidence.dart';
+import 'settings_bridge.dart';
+import 'terminal_management.dart';
+import 'attachment_imports.dart';
+import '../../domain/host/checkpoint_service.dart';
+import '../../domain/host/external_sessions.dart';
+import '../../core/providers.dart';
+import '../../data/library_paths.dart';
+import '../../state/model_context.dart';
+import '../../state/model_pricing.dart';
+import '../../state/work_memory.dart';
+import '../../state/work_processes.dart';
+import '../../data/context_prefs.dart';
+import '../../state/context_selection.dart';
+import '../../domain/context/context_window_manager.dart';
+import '../../data/chat_skill.dart';
+
+part 'terminal_commands.dart';
+part 'context_search_commands.dart';
+part 'external_session_commands.dart';
+part 'terminal_shell.dart';
+part 'terminal_workbench.dart';
+part 'terminal_project_tools.dart';
+part 'terminal_convenience.dart';
+
+class ControllerBridgeBackend
+    implements BridgeBackend, BridgeClientLifecycle, WindowTaskLifecycle {
+  ControllerBridgeBackend(this.container) {
+    Future<void>.microtask(() async {
+      try {
+        final values =
+            jsonDecode(
+                  container
+                          .read(sharedPrefsProvider)
+                          .getString('tuiSchedules.v1') ??
+                      '[]',
+                )
+                as List;
+        var migrated = false;
+        for (final value in values) {
+          if (value['owner_scope'] != null) {
+            value['enabled'] = false;
+            value['last_error'] = '原窗口已退出，定时任务已停用';
+            migrated = true;
+          }
+          if (value['workspace_id'] is! String || value['cwd'] is! String) {
+            value['enabled'] = false;
+            value['last_error'] = '旧任务未绑定工作目录，请重新保存后启用';
+            migrated = true;
+          }
+        }
+        if (migrated) {
+          await container
+              .read(sharedPrefsProvider)
+              .setString('tuiSchedules.v1', jsonEncode(values));
+        }
+        for (final value in values) {
+          if (value['enabled'] == true) {
+            _armSchedule(Map<String, dynamic>.from(value as Map));
+          }
+        }
+      } catch (_) {}
+    });
+  }
+  final ProviderContainer container;
+  final _shellJobs = <String, _ShellJob>{};
+  final _wbJobs = <String, _WorkbenchJob>{};
+  final _wbTimers = <String, Timer>{};
+  final _wbRemotes = <String, Map<String, dynamic>>{};
+  final _voiceCaptures = <String, (Process, String)>{};
+  final _followups = <String, List<Map<String, dynamic>>>{};
+  final _convenienceTokens = <String, CancelToken>{};
+  Timer? _followupTimer;
+  bool _followupPumping = false;
+  final _convenienceSending = <String>{};
+  bool get hasTerminalSchedules => _wbTimers.isNotEmpty;
+  bool get hasWorkbenchJobs =>
+      _voiceCaptures.isNotEmpty || _wbJobs.values.any((job) => !job.done) || _followups.values.any((queue)=>queue.isNotEmpty) || _convenienceTokens.isNotEmpty;
+  void closeWorkbench() {
+    for (final token in _convenienceTokens.values) { token.cancel('宿主关闭'); }
+    _followupTimer?.cancel();
+    for (final timer in _wbTimers.values) {
+      timer.cancel();
+    }
+    for (final v in _voiceCaptures.values) {
+      v.$1.kill();
+    }
+    for (final job in _wbJobs.values) {
+      job.token.cancel();
+    }
+  }
+
+  final _externalSessions = ExternalSessionService();
+  bool get hasActiveShell =>
+      _shellJobs.values.any((job) => !job.done) ||
+      _wbJobs.values.any((job) => !job.done);
+  Future<Map<String, Object?>> terminalBackup(
+    Map<String, dynamic> args,
+  ) async => throw const BridgeFailure('unsupported', '需要独立 Host');
+  bool get hasPendingLogin => _settingsBridge.loginActive;
+  late final _settingsBridge = TuiSettingsBridge(
+    container,
+    rememberSecrets: _profileSecrets.addAll,
+  );
+  late final _attachmentImports = TuiAttachmentImports(container);
+  late final _management = TuiManagementService(
+    container,
+    rememberSecrets: _profileSecrets.addAll,
+  );
+  Future<List<DesktopWorkspace>>? _workspaceCache;
+  DateTime _workspaceRead = DateTime.fromMillisecondsSinceEpoch(0);
+  final _profileSecrets = <String>{};
+  final _availableProfiles = <String>{};
+  DateTime _secretRead = DateTime.fromMillisecondsSinceEpoch(0);
+  Object? _secretSettings;
+  String _secretEpochSignature = '';
+  Future<void>? _secretsPending;
+  Future<String?>? _version;
+  final _resuming = <String>{};
+  final _gitCache =
+      <String, ({DateTime time, Future<Map<String, Object?>> value})>{};
+  final _draftOwners = <String, String>{};
+  final _draftProtected = <String, int>{};
+  final _clientSessions = <String, String>{};
+  final _releasedScopes = <String>{};
+  final _taskWindows = <String, TaskWindow>{};
+
+  @override
+  void registerWindowClient(String scope) {
+    _taskWindows.putIfAbsent(scope, () => TaskWindow(scope));
+  }
+
+  @override
+  Future<Map<String, Object?>> snapshotForWindow(
+    String scope,
+    String? session,
+  ) => runForWindow(scope, () => snapshot(session));
+
+  void cancelWindowScope(String scope) => _taskWindows[scope]?.close();
+
+  Future<T> runForWindow<T>(String? scope, Future<T> Function() action) {
+    if (scope != null && _releasedScopes.contains(scope)) {
+      throw const BridgeFailure('disconnected', '窗口已关闭，未接受新操作');
+    }
+    final window = _taskWindows[scope];
+    if (window == null) return action();
+    window.ensureOpen();
+    return window.run(action);
+  }
+
+  final _scopeCreations = <String, Set<Future<void>>>{};
+  final _draftReferences = <String, Set<String>>{};
+  Future<void> _draftCleanupTail = Future<void>.value();
+
+  bool _hasDraftContent(Conversation c) =>
+      c.hasUserActivity ||
+      c.messages.any(
+        (m) =>
+            m.content.trim().isNotEmpty ||
+            m.reasoning.trim().isNotEmpty ||
+            m.attachments.isNotEmpty ||
+            m.searchActivities.isNotEmpty,
+      );
+
+  bool _emptyDraft(String id) {
+    final c = state.conversations.where((c) => c.id == id).firstOrNull;
+    if (c == null ||
+        !c.messagesLoaded ||
+        _hasDraftContent(c) ||
+        (_draftProtected[id] ?? 0) > 0 ||
+        controller.isConversationRunning(id) ||
+        controller.isContextCompacting(id) ||
+        _resuming.contains(id)) {
+      return false;
+    }
+    final checkpoint = state.sessionCheckpoints[id]?.status;
+    if (checkpoint == SessionExecutionStatus.running ||
+        checkpoint == SessionExecutionStatus.waiting) {
+      return false;
+    }
+    if (container
+            .read(workApprovalsProvider)
+            .any((a) => a.conversationId == id) ||
+        container
+            .read(workQuestionsProvider)
+            .any((q) => q.conversationId == id) ||
+        container
+            .read(workTaskRuntimeProvider)
+            .any((r) => r.conversationId == id && r.status.isActive) ||
+        container
+            .read(workAgentsProvider)
+            .records
+            .any((a) => a.conversationId == id && !a.terminal) ||
+        container
+            .read(workChangesProvider)
+            .any((c) => c.conversationId == id) ||
+        container.read(workTaskSteeringProvider).snapshot(id).isNotEmpty) {
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _cleanupOwnedDrafts(String scope) {
+    final next = _draftCleanupTail
+        .catchError((Object _) {})
+        .then((_) async {
+          // Every candidate is a TUI-created draft; active references from another
+          // connection protect adopted/reconnected drafts regardless of creator.
+          for (final id in _draftOwners.keys.toList()) {
+            final c = state.conversations.where((c) => c.id == id).firstOrNull;
+            if (c == null || _hasDraftContent(c)) {
+              _draftOwners.remove(id);
+              _draftReferences.remove(id);
+              continue;
+            }
+            if (_draftReferences[id]?.isNotEmpty == true || !_emptyDraft(id)) {
+              continue;
+            }
+            _attachmentImports.discardSession(id);
+            await controller.deleteConversation(id);
+            if (!state.conversations.any((c) => c.id == id)) {
+              _draftOwners.remove(id);
+              _draftReferences.remove(id);
+            }
+          }
+        })
+        .catchError((Object _) {
+          // Existing controller deletion restores its row on persistence failure.
+          // Never erase another conversation to hide a failed draft cleanup.
+        });
+    _draftCleanupTail = next;
+    return next;
+  }
+
+  @override
+  Future<void> selectClientSession(String scope, String session) async {
+    _session(session); // A concurrent cleanup must not yield a stale success.
+    final previous = _clientSessions[scope];
+    if (previous != null && previous != session) {
+      _draftReferences[previous]?.remove(scope);
+    }
+    if (!_releasedScopes.contains(scope)) {
+      _clientSessions[scope] = session;
+      if (_draftOwners.containsKey(session)) {
+        (_draftReferences[session] ??= <String>{}).add(scope);
+      }
+    }
+    if (this is PersistentBridgeHost) {
+      controller.reportHostVisibleSessions(_clientSessions.values.toSet());
+    }
+    await _cleanupOwnedDrafts(scope);
+  }
+
+  @override
+  Future<void> releaseClient(String scope) async {
+    _convenienceTokens.remove(scope)?.cancel('窗口已关闭');
+    for (final queue in _followups.values) {
+      queue.removeWhere((entry) => entry['scope'] == scope);
+    }
+    final window = _taskWindows[scope];
+    window?.close();
+    for (final job in _shellJobs.values.where(
+      (job) => job.scope == scope && !job.done,
+    )) {
+      job.token.cancel('命令客户端已断开');
+    }
+    _management.release(scope);
+    _settingsBridge.releaseLogins(scope);
+    _releasedScopes.add(scope);
+    _clientSessions.remove(scope);
+    if (this is PersistentBridgeHost) {
+      controller.reportHostVisibleSessions(_clientSessions.values.toSet());
+    }
+    for (final references in _draftReferences.values) {
+      references.remove(scope);
+    }
+    for (final job in _wbJobs.values.where((j) => j.scope == scope)) {
+      job.token.cancel('终端已关闭');
+    }
+    _wbRemotes.removeWhere((_, value) => value['scope'] == scope);
+    for (final key
+        in _voiceCaptures.keys.where((k) => k.startsWith('$scope:')).toList()) {
+      _voiceCaptures.remove(key)?.$1.kill();
+    }
+    _attachmentImports.release(scope);
+    if (window != null) {
+      final prefs = container.read(sharedPrefsProvider);
+      final schedules =
+          jsonDecode(prefs.getString('tuiSchedules.v1') ?? '[]') as List;
+      var changed = false;
+      for (final schedule in schedules) {
+        if (schedule['owner_scope'] == scope) {
+          _wbTimers.remove(schedule['id'])?.cancel();
+          schedule['enabled'] = false;
+          schedule['last_error'] = '创建窗口已关闭，定时任务已停用';
+          changed = true;
+        }
+      }
+      if (changed) {
+        await prefs.setString('tuiSchedules.v1', jsonEncode(schedules));
+      }
+      await controller.stopWindowTasks(window);
+      _taskWindows.remove(scope);
+    }
+    await Future.wait(_scopeCreations[scope]?.toList() ?? <Future<void>>[]);
+    await _cleanupOwnedDrafts(scope);
+  }
+
+  ChatController get controller =>
+      container.read(chatControllerProvider.notifier);
+  ChatState get state =>
+      container.read(chatControllerProvider).value ?? const ChatState();
+  @override
+  List<String> get capabilities => const [
+    'terminal.convenience.v1',
+    'terminal.attachment-image-preview.v1',
+    ...TuiSettingsBridge.methods,
+    'terminal.query',
+    'terminal.action',
+    'context.model_limits',
+    'usage.dashboard',
+    'subscriptions.v1',
+    'subscriptions.accounts.v1',
+    'terminal.shell.v1',
+    'terminal.sessions.v1',
+    'terminal.provider-scan.v2',
+    'terminal.session-scan.v2',
+    'terminal.workspace-identity.v1',
+    'terminal.workspace-permissions.v1',
+    'terminal.todo.v1',
+    'terminal.ssh-output.v1',
+    'terminal.steering-status.v1',
+    'terminal.workbench.v1',
+    'terminal.workbench-files.v2',
+    'terminal.shared-agent-prompts.v1',
+    'terminal.workbench-receipts.v2',
+    'terminal.public-fetch.v1',
+    'terminal.ssh-forward.v1',
+    'llm.history.nonempty',
+    'mcp.bind',
+    'attachment.import',
+    'attachment.cancel',
+    'session.list',
+    'session.new',
+    'session.ensure',
+    'message.send',
+    'context.compact',
+    'queue.add',
+    'queue.remove',
+    'task.stop',
+    'task.resume',
+    'approval.decide',
+    'question.answer',
+    'models.list',
+    'model.set',
+    'permission.set',
+    'mode.set',
+    'workspace.list',
+    'workspace.prepare',
+    'workspace.register',
+    'workspace.set',
+    'changes.list',
+    'changes.diff',
+    'task.accept',
+    'task.revise',
+    'plan.get',
+    'plan.comment',
+    'plan.approve',
+    'plan.cancel',
+    'checkpoint.list',
+    'checkpoint.preview',
+    'checkpoint.restore',
+    'agents.list',
+    'agent.message',
+    'agent.stop',
+    'files.list',
+    'gui.open',
+  ];
+  Conversation _session(String id) {
+    final value = state.conversations.where((c) => c.id == id).firstOrNull;
+    if (value == null) throw const BridgeFailure('not_found', '会话不存在');
+    return value;
+  }
+
+  void _idle(String id) {
+    if (controller.isConversationRunning(id) ||
+        controller.isContextCompacting(id) ||
+        _resuming.contains(id) ||
+        state.sessionCheckpoints[id]?.status ==
+            SessionExecutionStatus.waiting) {
+      throw const BridgeFailure('busy', '任务运行中不能执行此操作');
+    }
+  }
+
+  SessionPolicy _policy(String id) =>
+      container.read(sessionPolicyProvider)[id] ?? const SessionPolicy();
+  Future<List<DesktopWorkspace>> _workspaces() async {
+    final host = container.read(desktopWorkspaceHostProvider);
+    if (!host.supported) return [];
+    if (_workspaceCache == null ||
+        DateTime.now().difference(_workspaceRead).inSeconds >= 5) {
+      _workspaceRead = DateTime.now();
+      _workspaceCache = host.list().catchError((Object error) {
+        _workspaceCache = null;
+        throw error;
+      });
+    }
+    return _workspaceCache!;
+  }
+
+  Map<String, Object?> _workspace(DesktopWorkspace w) => {
+    'id': w.id,
+    'name': w.name,
+    'path': w.root,
+    'access':
+        w.scopes.where((s) => s.name == 'root').firstOrNull?.access.wireValue ??
+        'deny',
+    'remote': false,
+  };
+  List<Map<String, Object?>> _remoteWorkspaces() => [
+    for (final profile in container.read(researchTerminalProvider).profiles)
+      {
+        'id': 'ssh:${profile.id}',
+        'name': profile.name,
+        'path': null,
+        'access': null,
+        'remote': true,
+      },
+  ];
+  List<Map<String, Object?>> _models() {
+    final settings = container.read(settingsControllerProvider).value;
+    if (settings == null) return [];
+    final result = <Map<String, Object?>>[];
+    for (final profile in settings.profiles) {
+      if (!profile.enabled) continue;
+      if (profile.authMode == 'apiKey' &&
+          !_availableProfiles.contains(profile.id) &&
+          !(profile.id == settings.activeProfileId &&
+              settings.apiKey.isNotEmpty)) {
+        continue;
+      }
+      for (final model in {
+        ...profile.models,
+        profile.chatModel,
+        profile.reasonerModel,
+      }.where((m) => m.isNotEmpty)) {
+        // settings.config carries the active model's explicit capabilities;
+        // re-derive them so each model lists its own reported/catalog efforts.
+        final config = applyReportedModelCapabilities(
+          settings,
+          settings.config.copyWith(
+            model: model,
+            profileId: profile.id,
+            baseUrl: profile.baseUrl,
+            apiFormat: profile.apiFormat,
+            authMode: profile.authMode,
+          ),
+        );
+        final caps = config.capabilities;
+        if (!caps.supportsTools) continue;
+        result.add({
+          'choice': modelSourceChoice(profile.id, model),
+          'id': model,
+          'source_id': profile.id,
+          'source': profile.name,
+          'source_host': Uri.tryParse(profile.baseUrl)?.host,
+          'efforts': reasoningEffortsFor(config).map((e) => e.wire).toList(),
+          'fast_supported': config.supportsPriorityTier,
+          'thinking_supported':
+              caps.supportsReasoningEffort ||
+              caps.sendThinkingField ||
+              caps.isReasoner,
+        });
+      }
+    }
+    for (final group in container.read(modelRouteGroupsProvider).groups) {
+      final members = [
+        for (final model in group.models)
+          ...result.where((m) => m['id'] == model && m['source'] != '路由组'),
+      ];
+      if (members.isEmpty) continue;
+      final efforts = (members.first['efforts'] as List).cast<String>().toSet();
+      for (final member in members.skip(1)) {
+        efforts.removeWhere((e) => !(member['efforts'] as List).contains(e));
+      }
+      result.add({
+        'choice': '$modelGroupPrefix${group.id}',
+        'id': group.name,
+        'source_id': group.id,
+        'source': '路由组',
+        'efforts': efforts.toList(),
+        'thinking_supported': members.every(
+          (m) => m['thinking_supported'] == true,
+        ),
+      });
+    }
+    return result;
+  }
+
+  List<Map<String, Object?>> _agents(String id) {
+    final records = container
+        .read(workAgentsProvider)
+        .records
+        .where((a) => a.conversationId == id)
+        .toList();
+    final byId = {for (final a in records) a.id: a};
+    final ordered = <WorkAgentRecord>[];
+    final seen = <String>{};
+    void visit(WorkAgentRecord agent) {
+      if (!seen.add(agent.id)) return;
+      ordered.add(agent);
+      for (final child in records.where((a) => a.parentId == agent.id)) {
+        visit(child);
+      }
+    }
+
+    final currentRoot = controller.taskSnapshotFor(id)?['agentRootId'];
+    if (currentRoot is String && currentRoot.isNotEmpty) {
+      final root = byId[currentRoot];
+      if (root != null) visit(root);
+    } else {
+      for (final root in records.where((a) => !byId.containsKey(a.parentId))) {
+        visit(root);
+      }
+      for (final remaining in records) {
+        visit(remaining);
+      }
+    }
+    return [
+      for (final a in ordered)
+        {
+          'id': a.id,
+          'parent_id': a.parentId,
+          'name': a.external ? '主代理' : a.role?.name ?? '子代理',
+          'task': a.task,
+          'depth': a.depth,
+          'model': a.model,
+          'status': a.status.name,
+          'rounds': a.rounds,
+          'input_tokens': a.inputTokens,
+          'output_tokens': a.outputTokens,
+          'read_only': a.readOnly,
+          if (a.manualEffort != null) 'effort': a.manualEffort!.name,
+          'activity': a.activity,
+          'elapsed_ms': a.terminal
+              ? null
+              : DateTime.now().difference(a.createdAt).inMilliseconds,
+          'output': a.output,
+        },
+    ];
+  }
+
+  Map<String, Object?> _change(WorkFileChange change) {
+    final lines = change.textSnapshot && change.beforeKnown
+        ? buildLineDiff(change.before, change.after ?? '')
+        : <DiffLine>[];
+    return {
+      'id': change.id,
+      'path': change.path,
+      'kind': change.deleted
+          ? 'D'
+          : change.isNew
+          ? 'A'
+          : 'M',
+      'added': change.textSnapshot && change.beforeKnown
+          ? lines.where((l) => l.kind == DiffLineKind.added).length
+          : null,
+      'removed': change.textSnapshot && change.beforeKnown
+          ? lines.where((l) => l.kind == DiffLineKind.removed).length
+          : null,
+      'diff': !change.textSnapshot
+          ? ['二进制文件：无文本差异']
+          : !change.beforeKnown
+          ? ['原始内容未知，无法生成准确差异']
+          : [
+              for (final line in lines)
+                '${switch (line.kind) {
+                  DiffLineKind.added => '+',
+                  DiffLineKind.removed => '-',
+                  _ => ' ',
+                }}${line.text}',
+            ],
+      'summary': change.reverted ? '已恢复' : null,
+      'round_id': change.roundId,
+      'message_id': change.assistantId,
+    };
+  }
+
+  List<Map<String, Object?>> _changes(String id) {
+    final latest = _session(
+      id,
+    ).activePath.where((m) => m.role == MessageRole.assistant).lastOrNull?.id;
+    return [
+      for (final c
+          in container
+              .read(workChangesProvider)
+              .where((c) => c.conversationId == id && c.assistantId == latest))
+        _change(c),
+    ];
+  }
+
+  String _connectedSsh(String workspace) {
+    final profile = workspace.substring(4);
+    final research = container.read(researchTerminalProvider);
+    if (!research.profiles.any((p) => p.id == profile)) {
+      throw const BridgeFailure('not_found', 'SSH 配置不存在');
+    }
+    if (!research.isConnected || research.activeProfile?.id != profile) {
+      throw const BridgeFailure('unsupported', '请先在 GUI 连接此 SSH 配置');
+    }
+    return profile;
+  }
+
+  String? _modelLabel(String? choice, String? fallback) {
+    if (choice == null) return fallback;
+    final source = parseModelSourceChoice(choice);
+    if (source != null) return source.model;
+    if (choice == autoModelChoice) return '自动选择';
+    if (choice.startsWith(modelGroupPrefix)) {
+      return container
+              .read(modelRouteGroupsProvider)
+              .groups
+              .where((g) => '$modelGroupPrefix${g.id}' == choice)
+              .firstOrNull
+              ?.name ??
+          '已移除的路由组';
+    }
+    return choice;
+  }
+
+  bool _blockedApproval(String? session, SearchActivity activity) {
+    if (activity.status != SearchActivityStatus.running || session == null) {
+      return false;
+    }
+    return container
+        .read(workApprovalsProvider)
+        .any(
+          (a) =>
+              a.conversationId == session &&
+              a.toolCallId != null &&
+              a.toolCallId == activity.toolCallId,
+        );
+  }
+
+  String _status(Conversation c) {
+    if (container
+        .read(workApprovalsProvider)
+        .any((a) => a.conversationId == c.id)) {
+      return 'approval';
+    }
+    if (controller.retryForSession(c.id)?['active'] == true) return 'retrying';
+    final checkpoint = state.sessionCheckpoints[c.id];
+    if (controller.isConversationRunning(c.id) ||
+        _resuming.contains(c.id) ||
+        checkpoint?.status == SessionExecutionStatus.waiting) {
+      return 'running';
+    }
+    if (checkpoint?.status == SessionExecutionStatus.cancelled ||
+        checkpoint?.status == SessionExecutionStatus.interrupted) {
+      return 'stopped';
+    }
+    if (checkpoint?.status == SessionExecutionStatus.failed ||
+        controller.errorForSession(c.id) != null) {
+      return 'failed';
+    }
+    final acceptance = container.read(
+      taskAcceptanceProvider,
+    )[controller.taskSnapshotFor(c.id)?['rootId']];
+    return switch (acceptance?.status) {
+      TaskAcceptanceStatus.accepted => 'completed',
+      TaskAcceptanceStatus.waitingAcceptance => 'completed',
+      TaskAcceptanceStatus.failed => 'failed',
+      _ => 'idle',
+    };
+  }
+
+  List<Map<String, Object?>> _sessions() => [
+    for (final c in state.conversations)
+      {
+        'id': c.id,
+        'title': c.title,
+        'status': _status(c),
+        'conversation_mode': c.mode.wire,
+        'work_mode': c.workMode,
+        'empty': c.messagesLoaded ? !c.hasUserActivity : null,
+        'workspace_id': _policy(c.id).sshProfileId.isNotEmpty
+            ? 'ssh:${_policy(c.id).sshProfileId}'
+            : container.read(conversationWorkspaceBindingsProvider)[c.id],
+        'updated_at': c.updatedAt.toUtc().toIso8601String(),
+      },
+  ];
+
+  @override
+  Future<Map<String, Object?>> snapshot(String? session) async {
+    await container.read(chatControllerProvider.future);
+    if (session != null) {
+      _session(session);
+      await controller.loadSession(session);
+      controller.requestAutomaticTitleForSession(session);
+    }
+    await _refreshSecrets();
+    final workspaces = await _workspaces();
+    final binding = container.read(
+      conversationWorkspaceBindingsProvider,
+    )[session];
+    final workspace = workspaces.where((w) => w.id == binding).firstOrNull;
+    final git = workspace == null ? <String, Object?>{} : await _git(workspace);
+    final version = await (_version ??= bridgeAppVersion());
+    // A key may rotate while workspace or package metadata is loading.
+    await _refreshSecrets();
+    if (binding !=
+        container.read(conversationWorkspaceBindingsProvider)[session]) {
+      return snapshot(session);
+    }
+    // Capture public state only after all metadata awaits, so text/status refer
+    // to one synchronous controller instant even if a stream changed meanwhile.
+    final c = session == null ? null : _session(session);
+    final core = session == null ? null : controller.taskSnapshotFor(session);
+    final repository = core?['repositoryContext'] as Map?;
+    final progress = container.read(workRoundsProvider)[session];
+    final policy = session == null ? const SessionPolicy() : _policy(session);
+    final remote = policy.sshProfileId.isNotEmpty;
+    final remoteProfile = remote
+        ? container
+              .read(researchTerminalProvider)
+              .profiles
+              .where((p) => p.id == policy.sshProfileId)
+              .firstOrNull
+        : null;
+    final workspaceLabel = remote
+        ? 'SSH · ${remoteProfile?.name ?? '已移除的配置'}'
+        : workspace?.name;
+    final workspacePath = remote ? policy.remoteRoot : workspace?.root;
+    final settings = container.read(settingsControllerProvider).value;
+    final choice = container.read(conversationModelChoiceProvider)[session];
+    final report = state.contextReports[session];
+    final records =
+        container
+            .read(workTaskRuntimeProvider)
+            .where((r) => r.conversationId == session)
+            .toList()
+          ..sort((a, b) => b.startedAt.compareTo(a.startedAt));
+    final runtime = records.firstOrNull;
+    final path = c?.activePath ?? <ChatMessage>[];
+    final steering = session == null
+        ? <Map<String, dynamic>>[]
+        : container.read(workTaskSteeringProvider).snapshot(session);
+    final steeringById = {for (final entry in steering) entry['id']: entry};
+    final steeringByHeader = {
+      for (final entry in steering) '【运行中补充 #${entry['id']}】': entry,
+    };
+    final evidence = TuiSnapshotEvidence(
+      conversationId: session,
+      messages: path,
+      changes: container.read(workChangesProvider),
+    );
+    final today = DateTime.now();
+    final plan = container.read(taskPlansProvider)[session];
+    final data = <String, Object?>{
+      'tasks': container
+          .read(taskOverviewProvider)
+          .map((t) => t.toJson())
+          .toList(),
+      'plan': plan == null
+          ? null
+          : {
+              ...plan.toJson(),
+              'content_hash': plan.contentHash,
+              'is_current': plan.taskId == core?['rootId'],
+            },
+      'session': c == null
+          ? null
+          : {
+              'id': c.id,
+              'title': c.title,
+              'status': _status(c),
+              'phase': _resuming.contains(c.id)
+                  ? '正在恢复任务'
+                  : state.sessionCheckpoints[c.id]?.phase,
+              'round': progress?.used,
+              'round_limit': progress?.limit,
+              'elapsed_ms': runtime == null
+                  ? null
+                  : (runtime.finishedAt ?? DateTime.now())
+                        .difference(runtime.startedAt)
+                        .inMilliseconds,
+              'mode': c.isStoryLike || c.isStudy
+                  ? c.mode.wire
+                  : policy.planOnly
+                  ? 'plan'
+                  : c.workMode
+                  ? 'work'
+                  : 'chat',
+              'permission': policy.approval.name,
+              'model': _modelLabel(choice, settings?.model),
+              'model_choice': choice,
+              'model_source_id':
+                  parseModelSourceChoice(choice ?? '')?.profile ??
+                  (choice == null ? settings?.activeProfileId : null),
+              'thinking': controller.thinkingForSession(c.id),
+              'fast': policy.fast,
+              'fast_supported': _fastSupported(c.id),
+              'request_count':
+                  container
+                      .read(workSessionInsightsProvider)[c.id]
+                      ?.requests
+                      .length ??
+                  0,
+              'task_request_count':
+                  container
+                      .read(workSessionInsightsProvider)[c.id]
+                      ?.countRequests(WorkRequestKind.task) ??
+                  0,
+              'title_request_count':
+                  container
+                      .read(workSessionInsightsProvider)[c.id]
+                      ?.countRequests(WorkRequestKind.title) ??
+                  0,
+              'auxiliary_request_count':
+                  container
+                      .read(workSessionInsightsProvider)[c.id]
+                      ?.countRequests(WorkRequestKind.auxiliary) ??
+                  0,
+              'effort': controller.effortForSession(c.id).wire,
+              'workspace_id': remote ? 'ssh:${policy.sshProfileId}' : binding,
+              'workspace_label': workspaceLabel,
+              'workspace_path': workspacePath,
+              'branch': remote ? null : git['branch'],
+              'usage': _terminalUsage(c.id),
+              'context_percent': report == null || report.inputBudgetTokens <= 0
+                  ? null
+                  : report.fraction * 100,
+              'error': controller.errorForSession(c.id),
+              'retry': controller.retryForSession(c.id),
+            },
+      'startup': {
+        'version': version,
+        'date':
+            '${today.year.toString().padLeft(4, '0')}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}',
+        'workspace': workspaceLabel,
+        'workspace_path': workspacePath,
+        'branch': remote ? null : git['branch'],
+        'dirty_count': remote ? null : git['dirty_count'],
+        'contexts': [
+          for (final source in repository?['sources'] as List? ?? [])
+            if (source is Map && source['path'] is String)
+              source['path'] as String,
+        ],
+        'issues': repository?['warnings'] ?? <Object?>[],
+      },
+      'messages': [
+        for (final m in path)
+          {
+            'id': m.id,
+            'role': m.role.name,
+            'text': m.content,
+            if (m.role == MessageRole.user &&
+                (steeringById.containsKey(m.id) ||
+                    steeringByHeader.containsKey(m.content.split('\n').first)))
+              'steering':
+                  steeringById[m.id] ??
+                  steeringByHeader[m.content.split('\n').first],
+            'thinking': m.reasoning,
+            'image_reference_receipts': [for (final activity in m.searchActivities) if (activity.toolName == 'generate_image' && activity.status == SearchActivityStatus.done && activity.resultText != null) activity.resultText],
+            'thinking_elapsed_ms': m.thinkingMillis > 0
+                ? m.thinkingMillis
+                : null,
+            'attachments': [
+              for (final a in m.attachments)
+                {
+                  'id': a.id,
+                  if (a.referenceTag != null) '_tag': a.referenceTag,
+                  'name': a.name,
+                  'mime': a.mimeType,
+                  'size': a.sizeBytes,
+                  if (a.isFileReference) ...{
+                    'reference': true,
+                    'path': a.referencePath,
+                    '_tag': a.referenceTag,
+                  },
+                },
+            ],
+          },
+      ],
+      'steps': [
+        for (final m in path)
+          for (final a in m.searchActivities)
+            {
+              'id': a.id,
+              'message_id': m.id,
+              'round_id': a.roundId,
+              if (a.contentOffset != null) 'content_offset': a.contentOffset,
+              'verb': _verb(a.toolName),
+              'object': TuiSnapshotEvidence.stepObject(a),
+              'status': a.interrupted
+                  ? 'stopped'
+                  : _blockedApproval(session, a)
+                  ? 'approval'
+                  : a.status.name,
+              'tail': const LineSplitter()
+                  .convert(
+                    _blockedApproval(session, a)
+                        ? ''
+                        : a.resultText ?? a.error ?? '',
+                  )
+                  .reversed
+                  .take(a.status == SearchActivityStatus.failed ? 3 : 2)
+                  .toList()
+                  .reversed
+                  .toList(),
+              'elapsed_ms': a.startedAt == null
+                  ? null
+                  : (a.finishedAt ?? DateTime.now())
+                        .difference(a.startedAt!)
+                        .inMilliseconds,
+              'exit_code': _exitCode(a.resultText),
+              ...evidence.stepLineCounts(m.id, a),
+              'detail': a.error,
+            },
+      ],
+      'approvals': [
+        for (final a
+            in container
+                .read(workApprovalsProvider)
+                .where((a) => a.conversationId == session))
+          {
+            'id': a.id,
+            'tool': a.tool,
+            'arguments': a.arguments,
+            'target': a.target,
+            'reason': a.reason,
+            'diff': evidence.approvalDiff(a),
+          },
+      ],
+      'questions': [
+        for (final q
+            in container
+                .read(workQuestionsProvider)
+                .where((q) => q.conversationId == session))
+          {
+            'id': q.id,
+            'questions': [
+              for (final item in q.questions)
+                {
+                  'id': item.id,
+                  'question': item.question,
+                  'options': item.options,
+                  'multiple': item.multiple,
+                  'required': item.required,
+                },
+            ],
+          },
+      ],
+      'changes': session == null ? [] : _changes(session),
+      'agents': session == null ? [] : _agents(session),
+      'steering': steering,
+      'queued': steering.where((e) => e['status'] == 'queued').toList(),
+      'followups': [for (final entry in _followups[session] ?? <Map<String, dynamic>>[]) {'id': entry['id'], 'text': entry['text'], 'status': 'next_task'}],
+      'models': _models(),
+      'workspaces': [...workspaces.map(_workspace), ..._remoteWorkspaces()],
+      'sessions': _sessions(),
+    };
+    return _redact(data);
+  }
+
+  int? _exitCode(String? text) {
+    try {
+      final result = jsonDecode(text ?? '') as Map;
+      return (result['exit_code'] as num?)?.toInt();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _verb(String? name) => switch (name) {
+    'coding_read_file' || 'coding_list_directory' => '读取',
+    'coding_write_file' || 'coding_edit_file' => '编辑',
+    'coding_create_directory' => '新建',
+    'work_run_command' => '运行',
+    'web_search' => '搜索',
+    'fetch_url' => '浏览',
+    'work_spawn_agent' => '委派子任务',
+    'work_list_agents' || 'work_agent_status' => '查看子任务',
+    'work_followup_agent' => '补充子任务',
+    'work_cancel_agent' => '停止子任务',
+    _ => '工具',
+  };
+  Map<String, Object?> _redact(Map<String, Object?> data) {
+    final settings = container.read(settingsControllerProvider).value;
+    final secrets = <String>[
+      if (settings != null) settings.apiKey,
+      if (settings != null) ...[
+        settings.searchApiKey,
+        settings.jevApiKey,
+        settings.visionApiKey,
+        settings.imageGenerationApiKey,
+        settings.ttsApiKey,
+        settings.asrApiKey,
+        settings.gatewayToken,
+        settings.gatewayLegacyToken,
+        ...settings.customMcpTokens.values,
+        ...settings.customMcpEnvironments.values.expand((m) => m.values),
+        ...settings.customMcpHeaders.values.expand((m) => m.values),
+      ],
+      ..._profileSecrets,
+    ];
+    return Map<String, Object?>.from(redactBridgeValue(data, secrets) as Map);
+  }
+
+  @override
+  Future<Map<String, Object?>> invoke(
+    String method,
+    Map<String, dynamic> params,
+  ) => runForWindow(
+    params['_bridge_client_scope'] as String?,
+    () => _invokeClient(method, params),
+  );
+
+  Future<Map<String, Object?>> _invokeClient(
+    String method,
+    Map<String, dynamic> params,
+  ) async {
+    final wb = params[method == 'terminal.query' ? 'topic' : 'action'];
+    if ((method == 'terminal.query' || method == 'terminal.action') &&
+        wb is String &&
+        wb.startsWith('wb.')) {
+      await _refreshSecrets();
+      final result = await _workbench(method, params);
+      return result['editor_file'] == true ? result : _redact(result);
+    }
+    final scope = params['_bridge_client_scope'] as String?;
+    final id = params['session_id'] as String?;
+    final protect =
+        (method == 'message.send' || method == 'task.revise') &&
+        scope != null &&
+        id != null &&
+        _draftOwners.containsKey(id);
+    if (protect) _draftProtected[id] = (_draftProtected[id] ?? 0) + 1;
+    final creation =
+        scope != null && (method == 'session.new' || method == 'session.ensure')
+        ? Completer<void>()
+        : null;
+    if (creation != null) {
+      (_scopeCreations[scope!] ??= <Future<void>>{}).add(creation.future);
+    }
+    try {
+      if (scope != null && _releasedScopes.contains(scope)) {
+        throw const BridgeFailure('disconnected', '连接已关闭');
+      }
+      return await _invoke(method, params);
+    } finally {
+      if (protect) {
+        final count = (_draftProtected[id] ?? 1) - 1;
+        if (count <= 0) {
+          _draftProtected.remove(id);
+        } else {
+          _draftProtected[id] = count;
+        }
+        await _cleanupOwnedDrafts(scope);
+      }
+      if (creation != null) {
+        creation.complete();
+        _scopeCreations[scope]?.remove(creation.future);
+        if (_scopeCreations[scope]?.isEmpty == true) {
+          _scopeCreations.remove(scope);
+        }
+      }
+    }
+  }
+
+  Future<Map<String, Object?>> _invoke(
+    String method,
+    Map<String, dynamic> params,
+  ) async {
+    await container.read(chatControllerProvider.future);
+    await _refreshSecrets();
+    if (!capabilities.contains(method)) {
+      throw const BridgeFailure('unsupported', '不支持此操作');
+    }
+    if (method == 'terminal.query' || method == 'terminal.action') {
+      if ((params[method == 'terminal.query' ? 'topic' : 'action'] as String? ??
+              '')
+          .startsWith('shell.')) {
+        return _redact(await _shellCommand(method, params));
+      }
+      if (_management.handles(method, params)) {
+        return _redact(await _management.invoke(method, params));
+      }
+      return _redact(await _terminalCommand(method, params));
+    }
+    if (method.startsWith('checkpoint.')) {
+      final id = requiredString(params, 'session_id');
+      _session(id);
+      final service = CheckpointService(container);
+      if (method == 'checkpoint.list') return _redact(await service.list(id));
+      final message = requiredString(params, 'message_id');
+      if (method == 'checkpoint.preview') {
+        return _redact(await service.preview(id, message));
+      }
+      if (params['confirmed'] != true) {
+        throw const BridgeFailure('confirmation_required', '请先核对检查点和回退范围');
+      }
+      return _redact(
+        await service.restore(
+          id,
+          message,
+          requiredString(params, 'fingerprint'),
+          requiredString(params, 'mode'),
+        ),
+      );
+    }
+    if (method.startsWith('plan.')) {
+      final id = requiredString(params, 'session_id');
+      _session(id);
+      final store = container.read(taskPlansProvider.notifier);
+      if (method == 'plan.get') {
+        final plan = container.read(taskPlansProvider)[id];
+        return _redact({
+          'plan': plan == null
+              ? null
+              : {...plan.toJson(), 'content_hash': plan.contentHash},
+        });
+      }
+      final revision = params['revision'];
+      if (revision is! int || revision < 1) {
+        throw const BridgeFailure('invalid_params', '计划版本无效');
+      }
+      switch (method) {
+        case 'plan.comment':
+          await store.comment(
+            id,
+            revision,
+            requiredString(params, 'text'),
+            stepId: params['step_id'] as String?,
+          );
+        case 'plan.approve':
+          await controller.approveTaskPlan(
+            id,
+            revision,
+            requiredString(params, 'content_hash'),
+          );
+          if (!controller.isConversationRunning(id) &&
+              state.sessionCheckpoints[id]?.resumeRequired == true) {
+            await controller.resumeSessionTask(id);
+          }
+        case 'plan.cancel':
+          if (container.read(taskPlansProvider)[id]?.taskId !=
+              controller.taskSnapshotFor(id)?['rootId']) {
+            throw const BridgeFailure('conflict', '该计划属于历史任务，未停止当前任务');
+          }
+          await store.cancel(id, revision);
+          controller.stop(conversationId: id);
+      }
+      return {'accepted': true};
+    }
+    if (method == 'mcp.bind') {
+      final id = requiredString(params, 'session_id');
+      final c = _session(id);
+      _idle(id);
+      if (params['selected'] is! bool) {
+        throw const BridgeFailure('invalid_params', 'selected 必须为布尔值');
+      }
+      if (params['confirmed'] != true) {
+        throw const BridgeFailure('confirmation_required', '请确认在此会话选用 MCP 服务');
+      }
+      final server = requiredString(params, 'id');
+      _settingsBridge.server(server);
+      final selected = {...c.customMcpServerIds};
+      if (params['selected'] == true) {
+        selected.add(server);
+      } else {
+        selected.remove(server);
+      }
+      await controller.setSessionMcpSelection(id, selected.toList());
+      return {
+        'accepted': true,
+        'session_id': id,
+        'selected': selected.contains(server),
+      };
+    }
+    if (TuiSettingsBridge.methods.contains(method)) {
+      final data = await _settingsBridge.invoke(method, params);
+      final id = params['session_id'] as String?;
+      if (id != null) {
+        final selected = _session(id).customMcpServerIds;
+        data['session_id'] = id;
+        data['mcp'] = [
+          for (final server in data['mcp'] as List? ?? [])
+            {
+              ...Map<String, Object?>.from(server as Map),
+              'selected': selected.contains(server['id']),
+            },
+        ];
+      }
+      return _redact(data);
+    }
+    if (method == 'attachment.import' || method == 'attachment.cancel') {
+      final session = requiredString(params, 'session_id');
+      _session(session);
+      final scope = requiredString(params, '_bridge_client_scope');
+      if (method == 'attachment.cancel') {
+        _attachmentImports.cancel(scope, session);
+        return {'accepted': true};
+      }
+      return {
+        'attachment': await _attachmentImports.import(scope, session, params),
+      };
+    }
+    if (method == 'session.list') {
+      final sessions = _sessions();
+      return {
+        'sessions': params['workspace_id'] == null
+            ? sessions
+            : sessions
+                  .where((s) => s['workspace_id'] == params['workspace_id'])
+                  .toList(),
+      };
+    }
+    if (method == 'models.list') return {'models': _models()};
+    if (method == 'workspace.list') {
+      return {
+        'workspaces': [
+          ...(await _workspaces()).map(_workspace),
+          ..._remoteWorkspaces(),
+        ],
+      };
+    }
+    if (method == 'workspace.prepare' || method == 'workspace.register') {
+      final rawPath = requiredString(params, 'path');
+      if (!p.isAbsolute(rawPath)) {
+        throw const BridgeFailure('invalid_params', '工作区路径必须为绝对路径');
+      }
+      final path = await Directory(rawPath).resolveSymbolicLinks();
+      final existing = (await _workspaces())
+          .where(
+            (w) => workspacePathIdentity(w.root) == workspacePathIdentity(path),
+          )
+          .firstOrNull;
+      if (existing != null) return {'workspace': _workspace(existing)};
+      if (method == 'workspace.prepare') {
+        return {'confirmation_required': true, 'path': path};
+      }
+      if (params['confirmed'] != true) {
+        throw const BridgeFailure('confirmation_required', '请确认工作区路径和权限');
+      }
+      final access = WorkspaceAccess.parse(requiredString(params, 'access'));
+      if (access == WorkspaceAccess.deny) {
+        throw const BridgeFailure('invalid_params', '请选择只读或读写权限');
+      }
+      final host = container.read(desktopWorkspaceHostProvider);
+      final workspace = await host.add(
+        id: const Uuid().v4(),
+        name: p.basename(path),
+        path: path,
+        access: access,
+      );
+      _workspaceCache = null;
+      return {'workspace': _workspace(workspace)};
+    }
+    if (method == 'session.new' || method == 'session.ensure') {
+      final scope = params['_bridge_client_scope'] as String?;
+      var workspaceId = params['workspace_id'] as String?;
+      if (method == 'session.ensure') {
+        if (scope == null) {
+          throw const BridgeFailure('invalid_params', '自动草稿需要明确的客户端来源');
+        }
+        if (!params.containsKey('workspace_id')) {
+          throw const BridgeFailure('workspace_required', '自动会话需要明确工作区');
+        }
+        if (workspaceId == null) {
+          final host = container.read(desktopWorkspaceHostProvider);
+          if (!host.supported) {
+            throw const BridgeFailure('workspace_required', '请选择已授权的工作区后开始');
+          }
+          final workspace = await host.defaultWorkspace();
+          workspaceId = workspace.id;
+          _workspaceCache = null;
+        }
+        for (final entry
+            in _draftOwners.entries
+                .where(
+                  (e) =>
+                      e.value == scope ||
+                      _draftReferences[e.key]?.contains(scope) == true,
+                )
+                .toList()) {
+          final binding = _policy(entry.key).sshProfileId.isNotEmpty
+              ? 'ssh:${_policy(entry.key).sshProfileId}'
+              : container.read(
+                  conversationWorkspaceBindingsProvider,
+                )[entry.key];
+          if (binding == workspaceId && _emptyDraft(entry.key)) {
+            await selectClientSession(scope, entry.key);
+            return {
+              'session_id': entry.key,
+              'workspace_id': workspaceId,
+              'created': false,
+              'draft': true,
+            };
+          }
+        }
+      }
+      if (workspaceId != null &&
+          !workspaceId.startsWith('ssh:') &&
+          !(await _workspaces()).any((w) => w.id == workspaceId)) {
+        throw const BridgeFailure('not_found', '工作区不存在');
+      }
+      if (workspaceId?.startsWith('ssh:') == true) _connectedSsh(workspaceId!);
+      final id = await controller.createWorkSession(
+        title: params['title'] as String?,
+      );
+      if (workspaceId?.startsWith('ssh:') == true) {
+        await container
+            .read(sessionPolicyProvider.notifier)
+            .save(
+              id,
+              _policy(id).copyWith(sshProfileId: workspaceId!.substring(4)),
+            );
+      } else if (workspaceId != null) {
+        await container
+            .read(conversationWorkspaceBindingsProvider.notifier)
+            .select(id, workspaceId);
+      }
+      if (scope != null) {
+        _draftOwners[id] = scope;
+        await selectClientSession(scope, id);
+        if (_releasedScopes.contains(scope)) {
+          throw const BridgeFailure('disconnected', '连接已关闭');
+        }
+      }
+      return {
+        'session_id': id,
+        'workspace_id': workspaceId,
+        'created': true,
+        'draft': scope != null,
+      };
+    }
+    if (method == 'gui.open') {
+      final page = params['page'];
+      if (page != null &&
+          !['session', 'settings', 'library', 'media'].contains(page)) {
+        throw const BridgeFailure('unsupported', '页面不存在');
+      }
+      final id = params['session_id'] as String?;
+      final changeId = params['change_id'] as String?;
+      final change = changeId == null
+          ? null
+          : container
+                .read(workChangesProvider)
+                .where((c) => c.id == changeId && c.conversationId == id)
+                .firstOrNull;
+      if (changeId != null && (id == null || change == null)) {
+        throw const BridgeFailure('not_found', '改动不属于此会话或已不存在');
+      }
+      if (id != null) {
+        _session(id);
+      }
+      await showBridgeGui(
+        container,
+        page: page as String? ?? 'session',
+        sessionId: id,
+        change: change,
+      );
+      return {'accepted': true};
+    }
+    final id = requiredString(params, 'session_id');
+    _session(id);
+    switch (method) {
+      case 'context.compact':
+        _idle(id);
+        final result = await controller.compactSessionContext(id);
+        return _redact({'accepted': true, 'result': result});
+      case 'message.send':
+      case 'task.revise':
+        _idle(id);
+        await controller.loadSession(id);
+        _idle(id);
+        final text = params['text'] as String? ?? '';
+        final attachments = _attachments(
+          params['attachments'],
+          session: id,
+          scope: params['_bridge_client_scope'] as String?,
+        );
+        if (text.trim().isEmpty && attachments.isEmpty) {
+          throw const BridgeFailure('invalid_params', '请输入消息或选择附件');
+        }
+        unawaited(
+          controller
+              .sendToSession(
+                id,
+                text,
+                attachments: attachments,
+                automaticTitle: true,
+                imageGenMode: container.read(settingsControllerProvider).requireValue.imageGenMode,
+              )
+              .then((accepted) {
+                final scope = params['_bridge_client_scope'] as String?;
+                if (accepted && scope != null) {
+                  _attachmentImports.consume(scope, id, [
+                    for (final a in params['attachments'] as List? ?? [])
+                      if (a is Map && a['token'] is String)
+                        a['token'] as String,
+                  ]);
+                }
+                if (scope != null) unawaited(_cleanupOwnedDrafts(scope));
+                return accepted;
+              })
+              .catchError((Object _) => false),
+        );
+      case 'queue.add':
+        final receipt = await controller.addWorkRequirement(
+          id,
+          requiredString(params, 'text'),
+        );
+        return {
+          'id': receipt,
+          'steering': container
+              .read(workTaskSteeringProvider)
+              .snapshot(id)
+              .firstWhere((entry) => entry['id'] == receipt),
+        };
+      case 'queue.remove':
+        return {
+          'text': await controller.withdrawWorkRequirement(
+            id,
+            requiredString(params, 'id'),
+          ),
+        };
+      case 'task.stop':
+        controller.stop(conversationId: id);
+      case 'task.resume':
+        final progress = container.read(workRoundsProvider)[id];
+        if (progress?.paused == true) {
+          container.read(workRoundsProvider.notifier).resume(id);
+        } else {
+          _idle(id);
+          _resuming.add(id);
+          unawaited(
+            _resume(id)
+                .catchError((Object _) {
+                  controller.reportExternalFailure(
+                    id,
+                    '任务恢复失败，请在 GUI 核对原工作区、权限和任务记录。',
+                  );
+                })
+                .whenComplete(() => _resuming.remove(id)),
+          );
+        }
+      case 'approval.decide':
+        container
+            .read(workApprovalsProvider.notifier)
+            .decideScoped(
+              id,
+              requiredString(params, 'id'),
+              requiredString(params, 'decision'),
+              reason: params['reason'] as String?,
+            );
+      case 'question.answer':
+        final question = requiredString(params, 'id');
+        if (!container
+            .read(workQuestionsProvider)
+            .any((q) => q.id == question && q.conversationId == id)) {
+          throw const BridgeFailure('not_found', '问题不存在');
+        }
+        container
+            .read(workQuestionsProvider.notifier)
+            .answer(
+              question,
+              Map<String, dynamic>.from(params['answers'] as Map),
+            );
+      case 'permission.set':
+        final permission = WorkApprovalMode.values
+            .where((p) => p.name == params['permission'])
+            .firstOrNull;
+        if (permission == null) {
+          throw const BridgeFailure('invalid_params', '无效权限');
+        }
+        if (permission == WorkApprovalMode.full &&
+            params['confirmed'] != true) {
+          throw const BridgeFailure('confirmation_required', '完全访问需要再次确认');
+        }
+        await container
+            .read(sessionPolicyProvider.notifier)
+            .save(id, _policy(id).copyWith(approval: permission));
+      case 'mode.set':
+        if (!['chat', 'work', 'plan'].contains(params['mode'])) {
+          throw const BridgeFailure('invalid_params', '无效模式');
+        }
+        final conversation = _session(id);
+        if (conversation.isStoryLike || conversation.isStudy) {
+          throw const BridgeFailure('unsupported', '学习和创作会话保留原模式，可直接继续对话');
+        }
+        final work = params['mode'] != 'chat';
+        if (conversation.workMode != work) {
+          _idle(id);
+          await controller.runHostCall(id, () async {
+            controller.setWorkMode(work);
+            await controller.persistHostSession(id);
+          });
+        }
+        await container
+            .read(sessionPolicyProvider.notifier)
+            .save(id, _policy(id).copyWith(planOnly: params['mode'] == 'plan'));
+      case 'model.set':
+        final choice = requiredString(params, 'choice');
+        final model = _models().where((m) => m['choice'] == choice).firstOrNull;
+        if (model == null) throw const BridgeFailure('not_found', '模型来源不存在');
+        final effort = params['effort'] as String?;
+        if (effort != null && !(model['efforts'] as List).contains(effort)) {
+          throw const BridgeFailure('invalid_params', '此模型不支持该思考强度');
+        }
+        await container
+            .read(conversationModelChoiceProvider.notifier)
+            .select(id, choice);
+        controller.configureSessionThinking(
+          id,
+          params['thinking'] == true,
+          effort == null
+              ? controller.effortForSession(id)
+              : ReasoningEffort.fromWire(effort),
+        );
+      case 'workspace.set':
+        _idle(id);
+        final workspace = requiredString(params, 'workspace_id');
+        if (workspace.startsWith('ssh:')) {
+          final profile = _connectedSsh(workspace);
+          await container
+              .read(sessionPolicyProvider.notifier)
+              .save(id, _policy(id).copyWith(sshProfileId: profile));
+          return {'accepted': true};
+        }
+        if (!(await _workspaces()).any((w) => w.id == workspace)) {
+          throw const BridgeFailure('not_found', '工作区不存在');
+        }
+        _idle(id);
+        container.read(workApprovalsProvider.notifier).revokeSession(id);
+        await container
+            .read(conversationWorkspaceBindingsProvider.notifier)
+            .select(id, workspace);
+        if (_policy(id).sshProfileId.isNotEmpty) {
+          await container
+              .read(sessionPolicyProvider.notifier)
+              .save(id, _policy(id).copyWith(sshProfileId: ''));
+        }
+      case 'changes.list':
+        return _redact({'changes': _changes(id)});
+      case 'changes.diff':
+        final changeId = requiredString(params, 'id');
+        final change = _changes(
+          id,
+        ).where((c) => c['id'] == changeId).firstOrNull;
+        if (change == null) throw const BridgeFailure('not_found', '改动不存在');
+        return _redact({
+          'id': changeId,
+          'path': change['path'],
+          'diff': change['diff'],
+        });
+      case 'task.accept':
+        _idle(id);
+        if (!await controller.verifyAndAcceptTask(id)) {
+          throw const BridgeFailure('conflict', '验收未通过');
+        }
+      case 'agents.list':
+        return _redact({'agents': _agents(id)});
+      case 'agent.message':
+      case 'agent.stop':
+        final agent = requiredString(params, 'id');
+        final runtime = container.read(workAgentsProvider);
+        if (runtime.record(agent)?.conversationId != id) {
+          throw const BridgeFailure('not_found', '子代理不存在');
+        }
+        if (method == 'agent.message') {
+          runtime.followup(agent, requiredString(params, 'text'));
+        } else {
+          runtime.cancel(agent);
+        }
+      case 'files.list':
+        return _redact(await _files(id, params['query'] as String? ?? ''));
+      default:
+        throw const BridgeFailure('unsupported', '不支持此操作');
+    }
+    return {'accepted': true};
+  }
+
+  Future<void> _resume(String id) async {
+    final checkpoint = state.sessionCheckpoints[id];
+    if (checkpoint?.resumeRequired == true) {
+      if (!await controller.resumeSessionTask(id) &&
+          controller.errorForSession(id) == null) {
+        controller.reportExternalFailure(id, '原任务未能恢复，请核对原工作区和验收条件后重试。');
+      }
+    } else {
+      await controller.sendToSession(id, '继续完成任务。先检查当前状态与已有结果，避免重复副作用。');
+    }
+  }
+
+  Future<void> _refreshSecrets() async {
+    while (true) {
+      if (_secretsPending case final pending?) {
+        await pending;
+        continue;
+      }
+      final settings = container.read(settingsControllerProvider).value;
+      final epochs = jsonEncode(
+        container.read(explicitCredentialEpochProvider),
+      );
+      if (identical(settings, _secretSettings) &&
+          epochs == _secretEpochSignature &&
+          DateTime.now().difference(_secretRead).inSeconds < 5) {
+        return;
+      }
+      final reading = (() async {
+        _availableProfiles.clear();
+        if (settings == null) return;
+        for (final profile in settings.profiles) {
+          try {
+            final credentials = await container
+                .read(settingsControllerProvider.notifier)
+                .readCurrentProfileCredentials(profile.id);
+            if (credentials.apiKey.isNotEmpty) {
+              _profileSecrets.add(credentials.apiKey);
+              _availableProfiles.add(profile.id);
+            }
+          } catch (_) {
+            /* An unavailable credential is never serialized. */
+          }
+        }
+      })();
+      _secretsPending = reading;
+      try {
+        await reading;
+        _secretSettings = settings;
+        _secretEpochSignature = epochs;
+        _secretRead = DateTime.now();
+      } finally {
+        _secretsPending = null;
+      }
+      // Recheck after I/O: callers waiting for an older refresh must also see
+      // rotations that happened while that refresh was in flight.
+    }
+  }
+
+  Future<Map<String, Object?>> _git(DesktopWorkspace workspace) {
+    final existing = _gitCache[workspace.id];
+    if (existing != null &&
+        DateTime.now().difference(existing.time).inSeconds < 10) {
+      return existing.value;
+    }
+    final operation = (() async {
+      if (!workspace.scopes.any(
+        (s) => s.name == 'root' && s.access != WorkspaceAccess.deny,
+      )) {
+        return <String, Object?>{};
+      }
+      try {
+        final root = await Directory(workspace.root).resolveSymbolicLinks();
+        final gitDirectory = Directory(p.join(root, '.git'));
+        if (!await gitDirectory.exists() ||
+            !p.isWithin(root, await gitDirectory.resolveSymbolicLinks())) {
+          return <String, Object?>{};
+        }
+        final location = [
+          '--git-dir=${gitDirectory.path}',
+          '--work-tree=$root',
+        ];
+        final branch = await Process.run(
+          'git',
+          [...location, 'symbolic-ref', '--short', 'HEAD'],
+          environment: {'GIT_OPTIONAL_LOCKS': '0'},
+        ).timeout(const Duration(seconds: 2));
+        final status = await Process.run(
+          'git',
+          [
+            '--no-optional-locks',
+            '-c',
+            'core.fsmonitor=false',
+            '-c',
+            'core.untrackedCache=false',
+            ...location,
+            'status',
+            '--porcelain=v1',
+            '-z',
+            '--untracked-files=normal',
+          ],
+          environment: {'GIT_OPTIONAL_LOCKS': '0'},
+        ).timeout(const Duration(seconds: 2));
+        if (status.exitCode != 0) return <String, Object?>{};
+        final records = (status.stdout as String).split('\u0000');
+        var count = 0;
+        for (var i = 0; i < records.length; i++) {
+          if (records[i].isEmpty) continue;
+          count++;
+          if (records[i].startsWith('R') ||
+              records[i].startsWith('C') ||
+              records[i].startsWith(' R') ||
+              records[i].startsWith(' C')) {
+            i++;
+          }
+        }
+        return <String, Object?>{
+          'branch': branch.exitCode == 0
+              ? (branch.stdout as String).trim()
+              : null,
+          'dirty_count': count,
+        };
+      } catch (_) {
+        return <String, Object?>{};
+      }
+    })();
+    _gitCache[workspace.id] = (time: DateTime.now(), value: operation);
+    return operation;
+  }
+
+  Future<Map<String, Object?>> _files(String id, String query) async {
+    final policy = _policy(id);
+    if (policy.sshProfileId.isNotEmpty) {
+      return _management.completeRemote(
+        policy.sshProfileId,
+        policy.remoteRoot,
+        query,
+      );
+    }
+    final normalized = query.replaceAll(r'\', '/');
+    if (normalized.startsWith('/') ||
+        normalized.contains(':') ||
+        normalized.split('/').contains('..')) {
+      throw const BridgeFailure('invalid_params', '只允许工作区内的相对路径');
+    }
+    final slash = normalized.lastIndexOf('/');
+    final directory = slash < 0 ? '.' : normalized.substring(0, slash);
+    final prefix = slash < 0 ? '' : normalized.substring(0, slash + 1);
+    final filter = normalized.substring(slash + 1).toLowerCase();
+    final binding = container.read(conversationWorkspaceBindingsProvider)[id];
+    if (binding == null || _policy(id).sshProfileId.isNotEmpty) {
+      throw const BridgeFailure('unsupported', '请先选择本机已授权工作区');
+    }
+    final token = CancelToken();
+    final session = await WorkspaceToolSession.open(
+      container.read(desktopWorkspaceHostProvider),
+      binding,
+      token,
+    );
+    try {
+      final result = jsonDecode(
+        await session.call('coding_list_directory', {
+          'path': directory.isEmpty ? '.' : directory,
+          'scope': 'root',
+        }, token),
+      );
+      final values = result is Map
+          ? (result['entries'] ?? result['files'])
+          : null;
+      if (values is! List) {
+        throw const BridgeFailure('unsupported', '工具未返回文件列表');
+      }
+      return {
+        'files': [
+          for (final item in values)
+            if (item is Map &&
+                '${item['name'] ?? item['path']}'.toLowerCase().contains(
+                  filter,
+                ))
+              {
+                'path': '$prefix${item['name'] ?? item['path']}',
+                'kind': item['kind'] ?? item['type'] ?? 'file',
+              },
+        ],
+      };
+    } finally {
+      await session.close();
+    }
+  }
+
+  List<Attachment> _attachments(Object? raw, {String? session, String? scope}) {
+    if (raw == null) return [];
+    if (raw is! List || raw.length > 8) {
+      throw const BridgeFailure('invalid_params', '最多 8 个附件');
+    }
+    final imported = <Attachment>[];
+    final legacy = <Object?>[];
+    for (final item in raw) {
+      if (item is Map && item['reference'] == true) {
+        final path = item['path'];
+        final tag = item['_tag'];
+        if (path is! String ||
+            !p.isAbsolute(path) ||
+            tag is! String ||
+            !RegExp(r'^\[(File|Audio|Video) [1-9][0-9]*\]$').hasMatch(tag)) {
+          throw const BridgeFailure('invalid_params', '文件地址或引用标签无效');
+        }
+        imported.add(
+          Attachment(
+            name: item['name'] as String? ?? p.basename(path),
+            mimeType: item['mime'] as String? ?? 'application/octet-stream',
+            sizeBytes: (item['size'] as num?)?.toInt() ?? 0,
+            referencePath: path,
+            referenceTag: tag,
+          ),
+        );
+      } else if (item is Map && item['token'] is String) {
+        if (session == null || scope == null) {
+          throw const BridgeFailure('invalid_params', '附件缺少来源会话');
+        }
+        imported.addAll(
+          _attachmentImports
+              .resolve(scope, session, item['token'] as String)
+              .map(
+                (a) => Attachment.fromJson({
+                  ...a.toJson(),
+                  if (item['_tag'] is String) 'referenceTag': item['_tag'],
+                }),
+              ),
+        );
+      } else {
+        legacy.add(item);
+      }
+    }
+    if (imported.length + legacy.length > 8) {
+      throw const BridgeFailure('too_large', '附件合计最多8个，请减少附件');
+    }
+    return [
+      ...imported,
+      for (final item in legacy)
+        (() {
+          if (item is! Map) {
+            throw const BridgeFailure('invalid_params', '附件格式无效');
+          }
+          final mime = item['mime'];
+          if (![
+            'image/png',
+            'image/jpeg',
+            'image/webp',
+            'text/plain',
+            'text/markdown',
+          ].contains(mime)) {
+            throw const BridgeFailure('invalid_params', '不支持的附件类型');
+          }
+          final bytes = base64Decode(item['data_base64'] as String);
+          if (bytes.length > 700 * 1024) {
+            throw const BridgeFailure('too_large', '附件过大');
+          }
+          return Attachment(
+            name: item['name'] as String,
+            mimeType: mime as String,
+            sizeBytes: bytes.length,
+            imageBase64: mime.startsWith('image/') ? base64Encode(bytes) : null,
+            text: mime.startsWith('text/') ? utf8.decode(bytes) : '',
+          );
+        })(),
+    ];
+  }
+}
