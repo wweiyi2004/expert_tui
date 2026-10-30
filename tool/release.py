@@ -18,6 +18,7 @@ REQUIRED_FILES = {
     'native/expert-tui.exe', 'native/expert-desktop.exe',
     'native/host/bin/expert-host.exe', 'native/host/lib/sqlite3.dll',
     'native/expert-media-worker/expert-media-worker.exe',
+    'native/expert-pdf-worker/expert-pdf-worker.exe',
     'bin/expert.cjs', 'lib/cli.cjs', 'lib/update.cjs', 'lib/runtime.cjs', 'expert.cmd',
 }
 

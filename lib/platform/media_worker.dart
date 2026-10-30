@@ -4,15 +4,17 @@ import 'package:path/path.dart' as p;
 import 'paths_host.dart';
 
 Map<String, dynamic> runMediaWorker(Map<String, Object?> request) {
+  final pdf = request['op'] == 'pdf_text';
+  final component = pdf ? 'expert-pdf-worker' : 'expert-media-worker';
   final program =
+      Platform.environment[pdf
+          ? 'EXPERT_PDF_WORKER'
+          : 'EXPERT_RUST_MEDIA_WORKER'] ??
+      // Retain the original all-operations override for existing integrations.
       Platform.environment['EXPERT_MEDIA_WORKER'] ??
-      p.join(
-        HostPaths.bundleDirectory,
-        'expert-media-worker',
-        'expert-media-worker.exe',
-      );
+      p.join(HostPaths.bundleDirectory, component, '$component.exe');
   if (!p.isAbsolute(program) || !File(program).existsSync()) {
-    throw StateError('独立文档/图像组件未安装，请使用包含 expert-media-worker 的完整发行包');
+    throw StateError('独立文档/图像组件未安装，请使用包含 $component 的完整发行包');
   }
   final temp = Directory.systemTemp.createTempSync('expert-media-request-');
   final input = File(p.join(temp.path, 'request.json'));

@@ -13,7 +13,8 @@ Portable ZIP users can run `expert.cmd`. User state is stored separately under
 `expert --version`, `expert update --check`, and `expert --snapshot welcome`
 are supported. Update uses this package's own npm identity.
 
-The bundle contains the Rust TUI, Dart Host, file tools, and media worker.
+The bundle contains the Rust TUI, Dart Host, file tools, Rust image/Zstd worker,
+and a separate Python PDF worker. Images and compressed sessions do not start Python.
 Audio/video extraction additionally requires ffmpeg/ffprobe.
 
 License: see LICENSE.

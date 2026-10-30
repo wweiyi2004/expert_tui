@@ -59,6 +59,7 @@ function validatePackage(root, expectedName, expectedVersion, full = true) {
   }
   for (const rel of ['native/expert-tui.exe', 'native/expert-desktop.exe', 'native/host/bin/expert-host.exe',
                      'native/host/lib/sqlite3.dll', 'native/expert-media-worker/expert-media-worker.exe',
+                     'native/expert-pdf-worker/expert-pdf-worker.exe',
                      'bin/expert.cjs', 'lib/cli.cjs', 'lib/update.cjs', 'lib/runtime.cjs', 'expert.cmd', 'package.json']) {
     if (!manifest.files[rel] || !fs.statSync(within(root, rel)).isFile()) throw new Error(`Incomplete release: ${rel}`);
   }

@@ -1,4 +1,4 @@
-"""Bounded, one-request PDF/image worker for the standalone desktop host."""
+"""Bounded, one-request PDF text worker. Images and Zstd are handled by Rust."""
 import base64
 import io
 import json
@@ -86,34 +86,6 @@ def main():
                 if count > 60000:
                     break
             result = {"text": "\n".join(parts)}
-        elif request["op"] == "session_zstd":
-            import zstandard
-            with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)) as reader:
-                expanded = reader.read(16 * 1024 * 1024 + 1)
-            if len(expanded) > 16 * 1024 * 1024:
-                raise ValueError("session exceeds decompression limit")
-            result = {"text": expanded.decode("utf-8")}
-        elif request["op"] == "image_resize":
-            from PIL import Image, ImageOps
-            Image.MAX_IMAGE_PIXELS = 40_000_000
-            image = Image.open(io.BytesIO(data))
-            limit = int(request.get("max_side", 1536))
-            if not 1 <= limit <= 4096 or image.width * image.height > 40_000_000:
-                raise ValueError("image dimensions exceed limit")
-            orientation = image.getexif().get(274, 1)
-            if max(image.size) <= limit and orientation == 1:
-                result = {"changed": False}
-            else:
-                image = ImageOps.exif_transpose(image)
-                if image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-                    image = image.convert("RGB")
-                image.thumbnail((limit, limit))
-                output = io.BytesIO()
-                image.save(output, format="PNG")
-                if output.tell() > 15 * 1024 * 1024:
-                    raise ValueError("output too large")
-                result = {"changed": True, "data": base64.b64encode(output.getvalue()).decode("ascii")}
-            image.close()
         else:
             raise ValueError("unsupported operation")
         print(json.dumps({"ok": True, **result}, ensure_ascii=True))

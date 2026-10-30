@@ -1,5 +1,5 @@
 [workspace]
-members = ["desktop", "tui"]
+members = ["desktop", "tui", "media-worker"]
 resolver = "3"
 
 [workspace.package]

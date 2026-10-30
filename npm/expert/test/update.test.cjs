@@ -19,7 +19,8 @@ function fixture(version, suffix = '') {
   const pkg = { name, version, bin: { expert: 'bin/expert.cjs' }, os: ['win32'], cpu: ['x64'] };
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg));
   for (const file of ['README.md', 'LICENSE', 'expert.cmd', 'native/expert-tui.exe', 'native/expert-desktop.exe',
-    'native/host/bin/expert-host.exe', 'native/host/lib/sqlite3.dll', 'native/expert-media-worker/expert-media-worker.exe']) {
+    'native/host/bin/expert-host.exe', 'native/host/lib/sqlite3.dll', 'native/expert-media-worker/expert-media-worker.exe',
+    'native/expert-pdf-worker/expert-pdf-worker.exe']) {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     fs.writeFileSync(path.join(dir, file), `fixture ${version}`);
   }

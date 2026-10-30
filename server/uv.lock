@@ -25,29 +25,31 @@ name = "expert-tui-media"
 version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "pillow" },
     { name = "pyinstaller" },
     { name = "pypdf" },
-    { name = "websockets" },
-    { name = "zstandard" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "jsonschema" },
+    { name = "pillow" },
+    { name = "websockets" },
+    { name = "zstandard" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "pillow", specifier = "==12.2.0" },
     { name = "pyinstaller", specifier = "==6.22.3" },
     { name = "pypdf", specifier = "==6.19.0" },
-    { name = "websockets", specifier = "==16.0" },
-    { name = "zstandard", specifier = "==0.25.0" },
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "jsonschema", specifier = ">=4,<5" }]
+dev = [
+    { name = "jsonschema", specifier = ">=4,<5" },
+    { name = "pillow", specifier = "==12.2.0" },
+    { name = "websockets", specifier = "==16.0" },
+    { name = "zstandard", specifier = "==0.25.0" },
+]
 
 [[package]]
 name = "jsonschema"

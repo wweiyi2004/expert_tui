@@ -1,6 +1,6 @@
 # Expert TUI
 
-独立的终端 AI 助手项目，迁自 `expert_chat` 当前工作区。包含 Rust TUI、纯 Dart 任务宿主、Rust 文件工具和 Python 文档媒体 worker。
+独立的终端 AI 助手项目，迁自 `expert_chat` 当前工作区。包含 Rust TUI、纯 Dart 任务宿主、Rust 文件工具、Rust 图片/Zstd worker 和 Python PDF worker。
 
 源码仓库：[wweiyi2004/expert_tui](https://github.com/wweiyi2004/expert_tui)。
 
@@ -20,6 +20,16 @@ python tool/build_native.py
 ```
 
 程序保留启动时的工作目录。可以从你的代码目录调用上述 EXE 的绝对路径。
+
+重复构建时使用新的输出目录，避免覆盖正在运行的版本：
+
+```powershell
+python tool/build_native.py --output output/native-next
+python tool/test_runtime.py --bundle output/native-next/bundle
+python tool/build_tui_npm_release.py --draft --skip-build --native-dir output/native-next
+```
+
+`build_native.py` 不覆盖已有的 `bundle`；每次选择一个新目录。未指定目录时仍使用 `output/native`，适用于首次构建和干净 CI 环境。
 
 生成带 Node.js 启动器和更新器的本地预览包：
 
@@ -55,10 +65,11 @@ node --test npm/expert/test/*.test.cjs
 
 Host 端到端验收使用临时目录和回环假模型，不调用付费服务。生成 npm 包后，还可运行 `node tool/test_tui_npm_release.cjs` 验证本地安装和升级。
 
-`test_runtime.py` 将图片集成测试指向本仓库构建的媒体 worker；需先完成原生 bundle 构建。
+`test_runtime.py` 将图片/Zstd 和 PDF 集成测试分别指向 Rust、Python worker；需先完成原生 bundle 构建。自定义输出目录时传入 `--bundle`。独立运行媒体验收时，可通过 `EXPERT_TEST_MEDIA_BINARY` 和 `EXPERT_TEST_PDF_BINARY` 指定对应 EXE。
 
 本次验证的结果及本机 Node.js 版本差异见 [验证记录](docs/VALIDATION.md)。
 逐文件迁移范围、补齐记录和 GUI 排除项见 [完整性复核](docs/COMPLETENESS.md)。
+第一轮图片/Zstd 原生替换、兼容边界与体积实测见 [Rust 媒体替换记录](docs/RUST-MEDIA-ROUND1.md)。
 
 ## 目录
 
@@ -66,9 +77,10 @@ Host 端到端验收使用临时目录和回环假模型，不调用付费服务
 | --- | --- |
 | `next/tui` | 终端界面及 headless 模式 |
 | `next/desktop` | 工作区文件工具 |
+| `next/media-worker` | 图片预处理和 Zstd 会话解压，保持单请求 JSON 协议 |
 | `bin`、`lib` | 纯 Dart Host、任务执行和存储 |
 | `third_party/xterm` | 保留 MIT 许可证的纯 Dart 终端核心子集 |
-| `server` | 最小媒体 worker 及独立 Python 依赖锁 |
+| `server` | 独立 Python PDF worker、媒体验收及 Python 依赖锁 |
 | `npm/expert` | Node.js 启动器、缓存和更新器 |
 | `design/tui` | 编译所需夹具、宠物资源和迁移时设计资料 |
 | `tool` | 当前项目独立构建及验收脚本 |

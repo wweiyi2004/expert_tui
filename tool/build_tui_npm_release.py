@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 
@@ -45,6 +46,8 @@ def main():
     parser.add_argument('--draft', action='store_true', help='Build a private local preview before npm login')
     # All components are built locally; no GUI release is required.
     parser.add_argument('--skip-build', action='store_true', help='Reuse already compiled native artifacts')
+    parser.add_argument('--native-dir', type=Path, default=ROOT / 'output/native',
+                        help='Native build directory produced by build_native.py')
     args = parser.parse_args()
     template = ROOT / 'npm/expert'
     version = re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / 'next/tui/Cargo.toml').read_text(), re.M)[1]
@@ -60,17 +63,21 @@ def main():
     if not re.fullmatch(r'[a-z0-9][a-z0-9._-]*', scope):
         raise ValueError('Invalid npm scope')
     name = f'@{scope}/expert'
+    native_build = args.native_dir.resolve()
     if not args.skip_build:
-        run(['python', 'tool/build_native.py'])
-    media = ROOT / 'output/native/expert-media-worker'
-    if not (media / 'expert-media-worker.exe').is_file():
-        raise RuntimeError('Run python tool/build_native.py first')
+        run([sys.executable, 'tool/build_native.py', '--output', str(native_build)])
+    bundle = native_build / 'bundle'
+    for relative in ['expert-tui.exe', 'expert-desktop.exe', 'host/bin/expert-host.exe',
+                     'expert-media-worker/expert-media-worker.exe', 'expert-pdf-worker/expert-pdf-worker.exe']:
+        if not (bundle / relative).is_file():
+            raise RuntimeError(f'Build the complete native bundle first; missing {relative}')
+    if '(Rust)' not in run([bundle / 'expert-media-worker/expert-media-worker.exe', '--version']):
+        raise RuntimeError('The image/Zstd component must be the Rust worker')
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     out = ROOT / 'output/releases' / f'expert-npm-{version}-{stamp}'
     out.mkdir(parents=True, exist_ok=False)
     package = out / 'package'
     package.mkdir()
-    host_build = ROOT / 'output/native/dart-build'
     for folder in ['bin', 'lib']:
         shutil.copytree(template / folder, package / folder)
     pkg = json.loads((template / 'package.json').read_text())
@@ -81,15 +88,7 @@ def main():
     shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
     shutil.copy2(template / 'expert.cmd', package / 'expert.cmd')
     native = package / 'native'
-    native.mkdir()
-    for exe in ['expert-tui.exe', 'expert-desktop.exe']:
-        shutil.copy2(ROOT / 'next/target/release' / exe, native / exe)
-    shutil.copytree(host_build / 'bundle', native / 'host')
-    (native / 'host/bin/expert_host.exe').rename(native / 'host/bin/expert-host.exe')
-    shutil.copytree(media, native / 'expert-media-worker')
-    math = native / 'data/flutter_assets/assets/math'
-    math.mkdir(parents=True)
-    shutil.copy2(ROOT / 'assets/math/toolkit.py', math / 'toolkit.py')
+    shutil.copytree(bundle, native)
     manifest = {'schema': 1, 'name': name, 'version': version, 'platform': 'win32-x64', 'files': {}}
     forbidden = {'expert_chat.exe', 'flutter_windows.dll', 'app.so', 'bridge.json', 'gui.json',
                  'owner.lock', 'operations.jsonl', '.npmrc', 'key.properties'}
